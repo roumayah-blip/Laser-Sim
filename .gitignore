@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.swp
+.DS_Store
+diagnostics_output/
+.cursor/
+.laser_sim/
+
+# Large local RP Photonics reference bundle (Liekki copy lives in laser_sim/materials/)
+RP spectroscopic Data/
+*.7z

@@ -1,0 +1,165 @@
+Taichi GPU Backend — Implementation Status Summary
+==================================================
+Date: 2026-05-15
+Project: Laser Sim (Yb fiber CPA)
+
+OVERVIEW
+--------
+Work was done to add an optional Taichi GPU backend for the two-pass fiber CPA
+solver, plus an LP-mode overlap calculator, per the phased spec. The default
+CPU path in fiber_cpa.py remains the primary implementation; backend='cpu' is
+unchanged unless explicitly set to 'taichi'.
+
+
+FILES CREATED
+-------------
+  laser_sim/physics/taichi_kernels.py
+    - init_taichi(arch, fp) — explicit init only (not at import)
+    - FieldCache with lazy ensure(n_z, n_t, n_lam)
+    - GPU kernels: pump z-advance, gain slab, RK4 populations, spontaneous
+      source, ASE forward/backward slabs
+    - kernel_qss_march_z exists but is NOT used on CUDA (see errors below)
+    - Kernels registered after ti.init() via _register_kernels() (deferred
+      from import time to avoid Taichi init-order bugs)
+    - warmup() only registers kernels (dry-run on tiny grid removed)
+
+  laser_sim/physics/taichi_solver.py
+    - run_fiber_cpa_taichi(cfg) → FiberCPAResult
+    - run_pump_pass_taichi — uses CPU _pump_pass() for QSS (hybrid)
+    - run_signal_pass_taichi — GPU gain + RK4 + bidirectional ASE (3 iter)
+    - Populations stored as fractions on GPU; rates use n_tot scaling
+
+  laser_sim/physics/lp_modes.py
+    - LPMode dataclass, find_lp_modes(), gamma_petermann_i(), mode_group_index()
+    - Bessel/Hankel characteristic equation + brentq root scan
+
+  tests/test_taichi_backend.py
+    - test_taichi_pump_absorption (CPU vs Taichi absorption, 1%)
+    - test_taichi_vs_cpu_gain (packet energy, 2%)
+    - test_lp_modes_30_250 (30 µm core, NA=0.06, 1030 nm)
+
+
+FILES MODIFIED (minimal, as specified)
+--------------------------------------
+  laser_sim/physics/fiber_cpa.py
+    - run_fiber_cpa(cfg, backend='cpu'|'taichi') with dispatch
+    - FiberCPAConfig.lp_modes: list | None = None
+    - FiberCPAResult.lp_modes, gamma_signal_per_mode
+
+  NOT modified (per spec): four_level.py, modes.py, dopant.py, runtime.py,
+  runner.py, app.py, dpg_app.py
+
+
+PHASE COMPLETION
+----------------
+  Phase 1 — Two-pass Taichi solver: MOSTLY DONE
+    - Pump z-advance, gain slab, RK4 on GPU
+    - Pump QSS march delegated to CPU _pump_pass() (CUDA workaround)
+    - Fraction-based populations on GPU for f32 stability
+
+  Phase 2 — Time-resolved bidirectional ASE: IMPLEMENTED (not fully validated)
+    - kernel_spontaneous_source, kernel_ase_fwd_slab, kernel_ase_bwd_slab
+    - N_ASE_ITER = 3 forward/backward sweeps
+    - W_ase coupling in kernel_rk4_populations when include_ase=1
+    - Differs from CPU time-averaged ASE; tests use include_ase=False for CPU match
+
+  Phase 3 — LP mode calculator: DONE
+    - find_lp_modes() for step-index fiber
+    - Taichi path calls find_lp_modes when cfg.lp_modes is None; uses LP01
+      gamma_overlap for Γ_s when modes exist (empty list for 10 µm core at V<~2)
+
+
+ERRORS ENCOUNTERED AND FIXES
+----------------------------
+  1. Taichi kernel type annotations
+     - ti.i32 / ti.f32 on kernels failed before and after init
+     - int/float work only AFTER ti.init(), not with
+       `from __future__ import annotations` (annotations become strings)
+     - Fix: remove future annotations from taichi_kernels.py; use int/float;
+       defer @ti.kernel definitions until _register_kernels() after init
+
+  2. ti.init() at import time
+     - @ti.kernel at module import fails if Taichi not initialized
+     - Fix: _register_kernels() called from init_taichi(); module-level kernel
+       names assigned after registration
+
+  3. CUDA warmup on tiny (2,2,2) grid
+     - Dry-run kernels on 2×2×2 grid then resizing fields left CUDA buffers
+       stale/zero on next run → populations all zero
+     - Fix: warmup() only calls _register_kernels(); no tiny-grid execution
+
+  4. CUDA serial QSS loop (kernel_qss_march_z)
+     - Long serial `for it in range(1, nt)` on GPU: n2 nonzero only at t≈0,
+       zero everywhere else (including CW steady-state at 200 µs) on CUDA
+     - Same kernel on Taichi CPU arch (x64) gives correct n2(t)
+     - Fix: run_pump_pass_taichi delegates to CPU _pump_pass() / 
+       march_populations_pump_qss; GPU used for signal pass only
+
+  5. lp_modes.py syntax
+     - Missing closing paren in _n_clad() sqrt — fixed
+
+  6. LP mode test expectation
+     - Spec said LP01 has lowest Γ among l=0 modes; physics gives LP01 highest
+       (most confined). Test updated to assert max Γ for LP01 among l=0 modes
+     - Modes with Γ≤0 filtered (e.g. LP21 near cutoff)
+
+  7. Test suite state pollution (OPEN)
+     - test_lp_modes + test_taichi_pump_absorption + test_taichi_vs_cpu_gain
+       run in one process: gain test fails (Taichi packet energy = 0)
+     - Each test passes in isolation
+     - Likely cause: FieldCache / CUDA state after first Taichi run with
+       different grid (n_z=150 pump test vs n_z=60 gain test) without reset
+     - Needs: ti.reset() between tests or per-run FieldCache invalidation
+
+
+TEST STATUS (manual runs, 2026-05-15)
+-------------------------------------
+  CPU path (unchanged default):
+    test_pump_absorption_17_db_per_m_over_2m  — PASS
+    test_cw_pumped_packet_shows_gain          — PASS
+
+  Taichi / LP (require taichi in venv):
+    test_lp_modes_30_250                      — PASS
+    test_taichi_pump_absorption               — PASS (isolated or after lp test)
+    test_taichi_vs_cpu_gain                   — PASS (isolated only)
+    All three in one process                  — FAIL on gain test (state pollution)
+
+  pytest not installed in .venv; tests run via python -c imports
+
+
+ARE NON-TAICHI FILES STILL FUNCTIONAL?
+--------------------------------------
+  YES. The CPU path is intact.
+
+  - run_fiber_cpa(cfg) defaults to backend='cpu' and runs the original body
+    unchanged (early return before any Taichi import).
+  - GUI runner (runner.py), Streamlit app, diagnostics, four_level, modes,
+    dopant calculators were not modified.
+  - Only fiber_cpa.py gained optional kwargs/fields; existing callers need no
+    changes.
+  - Verified: test_pump_absorption and test_fiber_gain pass via run_simulation()
+    → run_fiber_cpa(cfg) with default backend.
+
+
+KNOWN LIMITATIONS / NEXT STEPS
+------------------------------
+  1. Fix test isolation: reset Taichi or FieldCache between tests; or use
+     pytest fixture with ti.reset().
+  2. Re-enable GPU QSS if Taichi fixes long serial loops on CUDA, or implement
+     per-time-step kernel launches from Python.
+  3. Validate Phase 2 ASE vs CPU with include_ase=True and documented tolerances.
+  4. Wire backend='taichi' in GUI/runner if desired (not done; opt-in only).
+  5. find_lp_modes returns [] for V < ~2 (10 µm core); Marcuse Γ_s still used
+     when no LP modes found.
+  6. Add pytest to requirements for CI if not already planned.
+
+
+USAGE
+-----
+  from laser_sim.physics.fiber_cpa import run_fiber_cpa, FiberCPAConfig
+
+  result = run_fiber_cpa(cfg)                    # CPU (default)
+  result = run_fiber_cpa(cfg, backend='taichi')  # GPU hybrid
+
+  from laser_sim.physics.taichi_kernels import init_taichi
+  init_taichi(arch='cuda', fp='f32')  # optional; solver calls on first use

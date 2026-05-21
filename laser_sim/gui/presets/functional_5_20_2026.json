@@ -1,0 +1,13 @@
+{
+  "material_key": "yb_glass",
+  "core_diameter_um": 30.0,
+  "core_na": 0.06,
+  "cladding_diameter_um": 250.0,
+  "fiber_length_m": 1.0,
+  "cladding_pumped": true,
+  "ignore_gamma_for_n": false,
+  "abs_mode_db_per_m": true,
+  "pump_absorption_db_per_m": 14.6,
+  "total_absorption_db": 12.0,
+  "pump_wavelength_nm": 976.0
+}

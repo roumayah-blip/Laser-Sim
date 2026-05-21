@@ -1,0 +1,344 @@
+================================================================================
+LASER SIM — SIMULATION ARCHITECTURE & PHYSICS REFERENCE
+================================================================================
+Project: temporally resolved, spectrally resolved Yb fiber CPA amplifier (Python/NumPy).
+Last updated: 2026-05-18
+
+See also: README.md (install, GUI, commands).
+
+================================================================================
+1. PURPOSE
+================================================================================
+
+Simulate cladding-pumped Yb-doped fiber CPA amplifiers with:
+  • µs–ms (or CW) pump envelopes
+  • Chirped ns+ signal packets (up to 50 pulses, ≥0.5 ns spacing)
+  • Four-level Yb manifolds N₀, N₁, N₂, N₃
+  • Spectral grid P_s(z, t, λ) in W/nm
+  • Optional ASE / spontaneous emission (simplified)
+  • Streamlit GUI, Dear PyGui GUI, dopant & runtime calculators
+
+Primary implementation: CPU NumPy. Taichi/CUDA hooks planned, not in hot path.
+
+================================================================================
+2. CODE STRUCTURE
+================================================================================
+
+laser_sim/
+  constants.py           SI constants, DB_PER_NP = dB to Napier conversion
+  materials/
+    base.py              Material dataclass, σ(λ) interp, geometry helpers
+    liekki_yb.py           Parser for RP Photonics ``Liekki Yb.inc`` (σ_abs, σ_em vs λ)
+    yb_glass.py            YB_GLASS: Liekki tabulated σ_abs, σ_em; τ from same file (~0.88 ms)
+    yb_yag.py, yb_ylf.py   Alternate hosts (placeholder lines)
+  pulses/
+    chirp.py               ChirpedBurstSpec, PumpPulseSpec, time grids, build_*()
+  calculators/
+    dopant.py              N from κ (dB/m) or total dB; Γ_p, pump area
+    runtime.py             Grid size & wall-clock estimates
+  physics/
+    four_level.py          Quasi-2L rate equations, RK4, pump-QSS, spontaneous
+    modes.py               Signal mode area from NA, η_guided, V-number
+    fiber_cpa.py           Main engine: pump pass + signal pass
+    diagnostics.py         Text report, g₀(z), coefficient audit
+    rep_rate.py              Steady-state metric for rep-rate mode
+  viz/
+    plot_limits.py         Packet-centered t=0 plots, dual-axis helpers
+  gui/
+    runner.py              SimInputs → FiberCPAConfig → run_fiber_cpa
+    app.py                 Streamlit UI
+    dpg_app.py             Dear PyGui UI
+
+tests/                     Unit & integration tests
+scripts/check_cuda.py      Taichi CUDA probe
+run_gui.sh, run_dpg.sh     Launch scripts
+requirements.txt
+
+================================================================================
+3. SOLVER OVERVIEW (TWO-PASS, FOUR-LEVEL)
+================================================================================
+
+Grids:
+  z[0…L]     uniform, n_z points, Δz = L/(n_z−1)
+  t[0…T]     non-uniform: coarse over pump window + fine around packet
+  λ[]        signal wavelength samples
+
+Transit time per z-step: Δt_travel = Δz / v_g,  v_g = c / n_group
+
+PASS A — PUMP (build populations before signal)
+  For iz = 0 … n_z−1:
+    1. March N₀,N₁,N₂,N₃ along ALL t at this z (pump only, no signal)
+       → march_populations_pump_qss() when Δt ≫ τ₃₂, τ₁₀
+    2. Propagate pump: P_p(z+Δz,t) = P_p(z,t)·exp(−Γ_p·σ_p·N₀·Δz)
+
+PASS B — SIGNAL (amplification + saturation + ASE)
+  Mode: A_signal from core NA (default NA=0.06); Γ_s = min(1, A_signal/A_core)
+  P_s(0,t,λ) = input chirped packet (or CW at packet-average power)
+  For iz = 0 … n_z−2:
+    1. g(t,λ) = Γ_s [σ_e(λ) N₂ − σ_a(λ) N₀]   (quasi-2L; N₁≈0)
+    2. P_s(z+Δz) = P_s(z) · exp(g·Δz)
+    3. RK4 at signal times over Δt_travel (pump + stim); populations at iz+1
+       remain from pump pass (not copied from depleted iz slice)
+    4. Spontaneous: dN₂/dt includes −N₂/τ₂₁ (τ₂₁ from material, e.g. 896 µs)
+    5. ASE: η_guided · Γ_s · (N₂/τ₂₁) · σ_em(λ) spectrum → guided mode, amplified
+
+Outputs: FiberCPAResult (fields, populations, energies, pump absorbed %)
+
+================================================================================
+4. STEP-BY-STEP IN TIME (fixed z)
+================================================================================
+
+At one fiber position zᵢ, Pass A marches forward in t:
+
+  t=0 ──► pump rises (or CW on) ──► … ──► t = burst_start ──► packet times
+
+For each interval Δt = t[j+1] − t[j]:
+
+  (1) Read pump intensity I_p = P_p(t) / A_pump  (cladding area if cladding-pumped)
+
+  (2) Pump rates (per-ion coefficients, 1/s):
+        W_p,abs = Γ_p · σ_p(λ_p) · I_p / hν_p
+        W_p,esa = Γ_p · σ_ep(λ_p) · I_p / hν_p   (ESA from N₃, small)
+
+  (3) Quasi-steady fast manifold (pump-only QSS, Δt ≫ τ₃₂; N₁ skipped, τ₁₀→0):
+        N₃ ≈ W_p,abs · N₀ · τ₃₂ / (1 + W_p,esa·τ₃₂)
+        N₂ → N₂,ss = W_p,abs · N₀ · τ₂₁  (exponential approach, time constant τ₂₁)
+        N₁ = 0
+        N₀ = N_tot − N₂ − N₃
+
+  (4) Store N₀,N₂,N₃(t_j) for all j before propagating pump to zᵢ₊₁
+
+Pass B at zᵢ (signal present at some t):
+
+  For each t with P_s above threshold:
+    RK4 integrates quasi-2-level equations over Δt_travel with W_se, W_abs from
+    signal spectrum (stimulated emission N₂→N₀, absorption N₀→N₂).
+
+================================================================================
+5. STEP-BY-STEP IN Z (fixed t, after Pass A time history exists)
+================================================================================
+
+Pump propagation (Pass A, after time march at zᵢ):
+
+  For each time sample t:
+    α_p(t) = Γ_p · σ_p · N₀(zᵢ,t)
+    P_p(zᵢ₊₁,t) = P_p(zᵢ,t) · exp(−α_p · Δz)
+
+  Dopant: N = κ_np / (Γ_p · σ_p),  κ_np = (dB/m)/(10/ln10).
+
+Signal propagation (Pass B):
+
+    g = Γ_s [σ_e N₂ − σ_a N₀],   I_signal = P_s / A_signal
+    P_s(z+Δz) = P_s(z)·exp(g·Δz)
+    Populations at zᵢ₊₁ from pump pass (vary with depleted pump along z).
+
+Spontaneous emission & ASE:
+
+    Total decay N₂ → N₀ at rate 1/τ₂₁ (material.lifetime_s, default 896 µs).
+    Fraction η_guided = V²/(V²+2),  V = (2π/λ)·r_core·NA  (guided LP₀₁).
+    ASE source (W/nm): η · Γ_s · (N₂/τ₂₁) · hν·σ_em / ∫σ_em dλ
+    Added to forward/backward ASE bins and amplified with g·Δz.
+
+================================================================================
+6. PUMP ABSORPTION — HOW IT WORKS & RECENT FIX
+================================================================================
+
+User specification:
+  • Enter pump absorption in dB/m (e.g. 17 dB/m) or total dB over length
+  • Fiber length L (e.g. 2 m)
+
+Expected small-signal fraction absorbed:
+  f_abs = 1 − exp(−κ_p · L),   κ_p = (dB/m) / DB_PER_NP
+
+  Example: 17 dB/m × 2 m → κ_p L ≈ 7.83 Napier → f_abs ≈ 99.96%
+
+Implementation chain:
+  (1) dopant.estimate_dopant_concentration()
+        α_np = dB/m / DB_PER_NP
+        Γ_p = (r_core/r_clad)²   [cladding pump; 1.0 if core-pumped]
+        N = α_np / (Γ_p · σ_abs(λ_p))   [κ measured on fiber includes overlap]
+  (2) fiber_cpa: yb_concentration_m3 = N from (1)
+        cfg.pump_absorption_db_per_m is informational only (not used in z march)
+  (3) Spatial decay: exp(−Γ_p·σ_p·N₀·Δz) via advance_pump_power_z()
+
+GUI metric "Pump absorbed (energy fraction)":
+  1 − (∫ P_p(L,t) dt) / (∫ P_p(0,t) dt)
+
+BUG (fixed 2026-05-15):
+  Pass A used RK4 four-level march on µs time steps without QSS on fast levels.
+  That drove N₃→N_tot and N₀→0 (unphysical), so bleach hit a 5% floor and only
+  ~32% of pump was absorbed over 2 m at 17 dB/m.
+
+FIX (2026-05-15):
+  • march_populations_pump_qss() for Pass A (fast N₃ QSS)
+  • Removed artificial bleach floor (was clip(N₀/N_tot, 0.05, 1.0))
+
+FIX (2026-05-18):
+  • Quasi-2-level: N₁ skipped (τ₁₀→0); gain uses N₀ not N₁
+  • Pump z-step uses α_p = σ_p·N₀ only (datasheet κ sets N_tot, not Beer–Lambert in z)
+
+Cross-sections (yb_glass = Liekki tabulation, laser_sim/materials/Liekki_Yb.inc):
+  • σ_a(976 nm) = 2.50×10⁻²⁴ m²   (Liekki measurement)
+  • σ_e(976 nm) = 2.44×10⁻²⁴ m²
+  • σ_a(1030 nm) = 4.53×10⁻²⁶ m²
+  • σ_e(1030 nm) = 6.43×10⁻²⁵ m²
+  • τ₂₁ = 0.88 ms (``tau_Yb`` in .inc file)
+  • N_tot for 14.6 dB/m, 30/250 µm cladding-pumped fiber ≈ 9.34×10²⁵ m⁻³
+  • Transparency threshold at 1030 nm: β_t = σ_a/(σ_a+σ_e) ≈ 6.6% (N₂/N_tot)
+  • Pump for transparency (cladding, 30/250): ~22 W CW (order-of-magnitude; not ~288 W)
+  • Previous Gaussian model had σ_a(976 nm) ≈ 2.4×10⁻²⁵ m² (~10× too low); all prior
+    simulations using default yb_glass should be re-run with Liekki data.
+
+================================================================================
+7. FOUR-LEVEL LIFETIMES — LITERATURE & MODEL VALUES
+================================================================================
+
+Yb³⁺ in silica is usually described as a QUASI-TWO-LEVEL system (²F₇/₂ ground
+and ²F₅/₂ excited manifolds). The explicit four-level split is a modeling tool
+for pump sub-structure and lower-laser-level bottlenecking.
+
+Level mapping (model):
+  N₀ — ²F₇/₂ ground manifold (mostly lowest Stark level at room T)
+  N₃ — pump absorption band (~976 nm) before thermalization
+  N₂ — upper laser / storage (²F₅/₂, ~1 ms lifetime)
+  N₁ — lower laser Stark levels (thermal occupancy; fast relaxation to N₀)
+
+Parameter          Model default    Literature / notes
+─────────────────────────────────────────────────────────────────────────────
+τ₂₁ (N₂ spont.)    880 µs (default)   From Liekki Yb.inc ``tau_Yb:=0.88 ms`` (radiative upper-state)
+                                   (prior analytical default 896 µs was Xu et al. Fibers 2013)
+
+τ₃₂ (N₃→N₂ NR)     1 ps             Not directly cited in fiber datasheets; pump
+                                   manifold thermalizes in sub-ps–ns in rare-earth
+                                   glasses. Use 1–10 ps for stability; QSS when Δt≫τ₃₂.
+
+τ₁₀ (N₁→N₀)        1 ns             Stark thermalization within ground/excited
+                                   manifolds; ps–ns. Critical for ps pulses / fast
+                                   gain recovery; quasi-instantaneous for ns CPA.
+
+β₂₁               1.0              Branching of spontaneous emission to N₁ vs N₀
+
+For Nd³⁺ true four-level lasers, τ₂₁ ~ 250 µs and τ₁₀ in ns range — different ion.
+
+References (verify in your copies):
+  [1] S. Xu et al., "Characteristics and Laser Performance of Yb³⁺-Doped Silica
+      LMA Fibers…", Fibers 2013, 1(3):93 — σ_abs(976)=2.4×10⁻²⁵ m², τ_f≈896 µs
+  [2] R. Paschotta et al., Yb-doped fiber amplifiers (RP Photonics encyclopedia)
+  [3] Sci. Direct / J. Luminescence — Yb³⁺ silicate glasses (multi-ms lifetimes
+      in some bulk glasses; fiber typically ~1 ms)
+  [4] Vendor tabulated σ(λ) is now default (Liekki .inc); override via ``load_liekki_yb_cross_sections``
+
+================================================================================
+8. RATE EQUATIONS (CODE: four_level.py, quasi-2L default)
+================================================================================
+
+Conservation: N₀ + N₂ + N₃ = N_tot   (N₁ skipped, τ₁₀→0)
+
+dN₃/dt = W_p,abs·N₀ − W_p,esa·N₃ − N₃/τ₃₂
+
+dN₂/dt = N₃/τ₃₂ − W_se·N₂ + W_abs·N₀ − N₂/τ₂₁
+
+dN₀/dt = −(dN₂ + dN₃)
+
+W_se = Γ_s · Σ_λ σ_e(λ) · I_s(λ) / hν(λ),   I_s = P_s(λ) / A_signal
+W_abs = Γ_s · Σ_λ σ_a(λ) · I_s(λ) / hν(λ)
+
+Gain: g(λ) = Γ_s [σ_e(λ) N₂ − σ_a(λ) N₀]   (m⁻¹)
+
+Spontaneous: −N₂/τ₂₁ removes population at rate 1/τ₂₁ (e.g. 896 µs for Yb:glass).
+Guided fraction η of that power feeds ASE (modes.py); remainder is unguided loss.
+
+================================================================================
+9. GEOMETRY, MODES & OVERLAP (modes.py)
+================================================================================
+
+Cladding-pumped (default):
+  A_pump = π r_clad²
+  Γ_p = (r_core / r_clad)²
+  I_p = P_p / A_pump
+
+Signal mode (input: core NA, default 0.06):
+  w_mode ≈ 0.61 · λ / (2π · NA)
+  A_signal = π w_mode²
+  Γ_s = min(1, A_signal / A_core)
+
+Normalized frequency & guided fluorescence:
+  V = (2π/λ_signal) · r_core · NA
+  η_guided = V² / (V² + 2)   [LP₀₁ power in core, Marcuse step-index approx.]
+
+Dopant N from κ (dB/m):
+  N = κ_np / (Γ_p · σ_abs)
+
+================================================================================
+10. PULSES & TIME GRID
+================================================================================
+
+chirp.py:
+  build_cpa_time_grid() — coarse linspace(0, T_pump) + fine around packet
+  build_chirped_burst() — Gaussian chirped pulses, incoherent sum if overlap
+  build_pump_power() — flat_top, gaussian, trapezoid, CW
+  rep_rate_mode — periodic packets for steady-state analysis
+
+Default packet (GUI): 0.8 ns chirp, 2.5 ns spacing, 5 pulses
+Default burst delay: 200 µs (pump builds inversion before packet)
+
+================================================================================
+11. GUI & RUN PIPELINE
+================================================================================
+
+SimInputs (runner.py) →
+  load_material, estimate_dopant_concentration →
+  build_cpa_time_grid, wavelength grid →
+  FiberCPAConfig → run_fiber_cpa() → FiberCPAResult
+
+Plots (viz/plot_limits.py):
+  Temporal: t_rel = t − t_packet_center (ns), dual y-axis in/out
+  Spectrum, heatmap P(t,λ), pump α(z), mean P_p(z)
+
+================================================================================
+12. KNOWN LIMITATIONS
+================================================================================
+
+  • Default σ(λ) is Liekki tabulated data (see §6); alternate hosts remain placeholders
+  • No GVD, Kerr, polarization, transverse mode competition
+  • ASE uses η_guided spontaneous source + exponential gain (not full MBE)
+  • Pass A then Pass B (not fully coupled space-time cone)
+  • τ₃₂, τ₁₀ defaults are order-of-magnitude; ps rogue-wave studies need
+    finer Δt ≪ τ₁₀ in the packet window only
+  • NumPy CPU only in hot loop (~tens of s for large grids)
+
+================================================================================
+13. TESTS
+================================================================================
+
+  tests/test_calculators.py
+  tests/test_chirp_packet.py
+  tests/test_cw_pump.py
+  tests/test_four_level.py
+  tests/test_fiber_gain.py
+  tests/test_pump_absorption.py   — 17 dB/m × 2 m → >85% absorbed
+  tests/test_rep_rate.py
+  tests/test_streamlit_runner.py
+
+Run:  for f in tests/test_*.py; do .venv/bin/python "$f"; done
+
+================================================================================
+14. QUICK PHYSICS CHECKS (command line)
+================================================================================
+
+  cd "Laser Sim"
+  .venv/bin/python -c "
+  from laser_sim.gui.runner import SimInputs, run_simulation
+  from laser_sim.constants import DB_PER_NP
+  import numpy as np
+  db, L = 17.0, 2.0
+  r = run_simulation(SimInputs(pump_cw=True, pump_absorption_db_per_m=db,
+      fiber_length_m=L, n_z=150)).result
+  exp = 1-np.exp(-db/DB_PER_NP*L)
+  print('absorbed', r.pump_power_absorbed_fraction*100, '%  expected', exp*100, '%')
+  print('N0 mean fraction', r.populations.n0.mean())
+  "
+
+================================================================================
+END
+================================================================================

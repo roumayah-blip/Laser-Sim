@@ -1,0 +1,7 @@
+numpy>=1.24
+scipy>=1.10
+streamlit>=1.28
+plotly>=5.18
+h5py>=3.9
+taichi>=1.7.0
+dearpygui>=1.11
