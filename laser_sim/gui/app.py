@@ -35,7 +35,7 @@ from laser_sim.gui.runner import (
     run_simulation,
 )
 from laser_sim.materials import load_material
-from laser_sim.pulses.chirp import ChirpedBurstSpec
+from laser_sim.pulses.chirp import ChirpedBurstSpec, time_resolution_preset
 from laser_sim.viz.plot_limits import (
     apply_plotly_spectrum_layout,
     apply_plotly_temporal_dual_axis,
@@ -44,9 +44,37 @@ from laser_sim.viz.plot_limits import (
     integrate_signal_spectrum,
     packet_center_time_s,
     pump_plot_limits,
+    resolve_plot_spec_from_signal,
     sample_temporal_traces,
     spectrum_plot_limits,
 )
+
+def _render_flat_packet_weights_ui(outcome, *, button_key: str) -> None:
+    """Show suggested per-pulse weights and apply button (needs burst_count ≥ 2)."""
+    if outcome.suggested_flat_weights is not None:
+        w = outcome.suggested_flat_weights
+        w_apply = ", ".join(f"{x:.4f}" for x in w)
+        st.markdown(
+            f"**Suggested flat-packet weights** (mean=1, copy or apply): `[{w_apply}]`  "
+            f"(peak/mean {max(w) / max(min(w), 1e-30):.2f}×)"
+        )
+        if st.button("⟳ Apply flat-packet weights to next run", key=button_key):
+            st.session_state["pulse_weights"] = w_apply
+            st.rerun()
+        return
+    r = outcome.result
+    if r is None or not outcome.ok:
+        return
+    n_burst = len(r.pulse_energies_in_j) if r.pulse_energies_in_j is not None else 0
+    if n_burst <= 1:
+        st.caption(
+            "Flat-packet weights: set **Pulses in packet** ≥ 2 to enable equalization."
+        )
+    elif r.pulse_energies_in_j is None or r.pulse_energies_out_j is None:
+        st.caption(
+            "Flat-packet weights unavailable (per-pulse energies missing from this backend)."
+        )
+
 
 st.set_page_config(page_title="Laser Sim — CPA Fiber", layout="wide")
 st.title("Ytterbium fiber CPA amplifier")
@@ -66,6 +94,7 @@ _DEFAULTS = {
     "pump_abs_db_per_m": 6.0,
     "total_abs_db": 12.0,
     "pump_wl_nm": 976.0,
+    "sim_pump_wl_nm": 976.0,
     "sim_backend": "cuda",
 }
 for _k, _v in _DEFAULTS.items():
@@ -116,7 +145,15 @@ core_na = st.sidebar.number_input(
     help="Sets signal mode area and guided spontaneous fraction η.",
 )
 clad_um = st.sidebar.number_input("Cladding diameter (µm)", 50.0, 1000.0, key="clad_um", step=10.0)
-fiber_length_m = st.sidebar.number_input("Fiber length (m)", 0.1, 20.0, key="fiber_length_m", step=0.1)
+fiber_length_m = st.sidebar.number_input(
+    "Fiber length (m)",
+    min_value=1e-5,
+    max_value=20.0,
+    step=0.001,
+    format="%.6f",
+    key="fiber_length_m",
+    help="Active Yb-doped length. Values down to ~10 µm are allowed (use enough z steps).",
+)
 cladding_pumped = st.sidebar.checkbox("Cladding pumped", key="cladding_pumped")
 ignore_gamma_for_n = st.sidebar.checkbox(
     "Ignore Γ_p when solving N (legacy N = κ/σ only)",
@@ -167,7 +204,15 @@ pump_abs_db_per_m = st.sidebar.number_input(
 total_abs_db = st.sidebar.number_input(
     "Total pump absorption (dB)", 0.1, 100.0, key="total_abs_db", step=0.5
 )
-pump_wl_nm = st.sidebar.number_input("Pump wavelength (nm)", 850.0, 1100.0, key="pump_wl_nm", step=1.0)
+pump_wl_nm = st.sidebar.number_input(
+    "Pump λ for N calc (nm)",
+    850.0,
+    1100.0,
+    key="pump_wl_nm",
+    step=1.0,
+    help="Wavelength assumed in the fiber datasheet pump absorption (dB/m). "
+    "Used only to back-calculate Yb concentration, not necessarily the simulation pump.",
+)
 
 if abs_mode == "dB/m":
     dopant_est = estimate_dopant_concentration(
@@ -314,6 +359,27 @@ with tab_run:
     r1, r2, r3 = st.columns(3)
     with r1:
         pump_peak_w = st.number_input("Pump peak power (W)", 0.1, 5000.0, 80.0, 1.0)
+        sim_pump_match = st.checkbox(
+            "Simulation pump λ = datasheet λ",
+            value=True,
+            key="sim_pump_match_wl",
+            help="Uncheck to pump at a different wavelength in the physics run "
+            "(must lie within the glass σ table).",
+        )
+        if sim_pump_match:
+            sim_pump_wl_nm = pump_wl_nm
+            st.caption(f"Simulation pump: **{sim_pump_wl_nm:.1f} nm** (same as N calc)")
+        else:
+            wl_lo, wl_hi = material.wavelength_range_nm
+            sim_pump_wl_nm = st.number_input(
+                "Simulation pump λ (nm)",
+                float(wl_lo),
+                float(wl_hi),
+                float(st.session_state.get("sim_pump_wl_nm", pump_wl_nm)),
+                1.0,
+                key="sim_pump_wl_nm",
+                help=f"Must be within {material.name} table: {wl_lo:.0f}–{wl_hi:.0f} nm.",
+            )
         pump_mode_run = st.selectbox("Pump mode", ["Pulsed", "CW (steady)"], key="pump_mode_run")
         pump_cw_run = pump_mode_run.startswith("CW")
         # Both inputs always exist (avoids NameError when switching pump mode).
@@ -344,8 +410,44 @@ with tab_run:
     with r2:
         sig_center_run = st.number_input("Signal center (nm)", 980.0, 1100.0, 1030.0, 1.0, key="sig_c_run")
         sig_bw_run = st.number_input("Signal bandwidth (nm)", 1.0, 40.0, 8.0, 0.5, key="sig_bw_run")
-        pulse_energy_uj = st.number_input("Energy per chirped pulse (µJ)", 0.01, 10000.0, 1.0, 0.1)
+        packet_energy_uj = st.number_input("Packet energy (µJ)", 0.01, 10000.0, 10.0, 0.1)
         chirp_ns_run = st.number_input("Chirped duration (ns)", 0.5, 50.0, 0.8, 0.1, key="chirp_run")
+
+    st.markdown("**Rep-rate steady state** (CW pump: repeat packet until output stabilizes)")
+    rep_col1, rep_col2, rep_col3 = st.columns(3)
+    with rep_col1:
+        rep_rate_mode = st.checkbox(
+            "Enable rep-rate mode",
+            value=False,
+            disabled=not pump_cw_run,
+            help="Requires CW pump. Repeats the pulse packet at the rep rate.",
+        )
+    with rep_col2:
+        rep_rate_khz = st.number_input("Rep rate (kHz)", 0.1, 10_000.0, 100.0, 1.0)
+    with rep_col3:
+        n_periods = st.number_input(
+            "Periods to simulate",
+            5,
+            200,
+            40,
+            1,
+            help="Only used when steady-state warmup is OFF — then we resolve every "
+            "packet period explicitly. With warmup ON we lump per-period extraction "
+            "until N₂(z) converges, then run ONE time-resolved period.",
+        )
+    rr_a, rr_b = st.columns(2)
+    with rr_a:
+        steady_tol = st.slider("Steady-state tolerance", 0.001, 0.1, 0.02, 0.001, format="%.3f")
+    with rr_b:
+        steady_state_warmup = st.checkbox(
+            "Lumped steady-state warmup (RP-Fiber-Power-style)",
+            value=True,
+            disabled=not (rep_rate_mode and pump_cw_run),
+            help="Iterate per-period Frantz–Nodvik extraction + pump rebuild on a "
+            "single representative packet until N₂(z) just-before-packet converges, "
+            "then run only ONE time-resolved period. Drops n_t by a factor of ~n_periods.",
+        )
+
     with r3:
         burst_n = st.number_input("Pulses in packet", 1, 50, 5, 1, key="burst_n")
         burst_sp_ns = st.number_input(
@@ -357,15 +459,34 @@ with tab_run:
             key="burst_sp",
             help="Min 0.5 ns. Overlaps sum in intensity.",
         )
-        burst_start_us = st.number_input(
-            "Packet delay after t=0 (µs)",
-            0.0,
-            5000.0,
-            200.0,
-            10.0,
-            key="burst_t0",
-            help="Align chirped packet with pump build-up (CPA).",
-        )
+        rep_burst_auto = rep_rate_mode and pump_cw_run
+        if rep_burst_auto:
+            t_rep_ms = 1000.0 / rep_rate_khz
+            st.caption(
+                f"Burst delay: auto (1 rep period = {t_rep_ms:.4f} ms) — "
+                "CW pump warm-started to steady state"
+            )
+            # µs: T_rep = 1/(rep_rate_khz·1e3 Hz); do not use 1/rep_rate_khz (that treats kHz as Hz).
+            burst_start_us = 1000.0 / rep_rate_khz
+        else:
+            burst_start_us = st.number_input(
+                "Packet delay after t=0 (µs)",
+                0.0,
+                5000.0,
+                200.0,
+                10.0,
+                key="burst_t0",
+                help="Align chirped packet with pump build-up (CPA).",
+            )
+            if rep_rate_mode and not pump_cw_run:
+                try:
+                    _mat_rr = load_material(mat_key)
+                    _tau_ms = 4.0 * _mat_rr.lifetime_s * 1000.0
+                    st.warning(
+                        f"For accurate steady state, set burst delay ≥ 4×τ₂₁ = {_tau_ms:.2f} ms"
+                    )
+                except Exception:
+                    pass
         pulse_weights_text = st.text_input(
             "Packet power weights (comma-separated)",
             "",
@@ -399,21 +520,54 @@ with tab_run:
             "(sanity check for expected gain).",
         )
 
-    st.markdown("**Rep-rate steady state** (CW pump: repeat packet until output stabilizes)")
-    rep_col1, rep_col2, rep_col3 = st.columns(3)
-    with rep_col1:
-        rep_rate_mode = st.checkbox(
-            "Enable rep-rate mode",
-            value=False,
-            disabled=not pump_cw_run,
-            help="Requires CW pump. Repeats the pulse packet at the rep rate.",
+    st.markdown("**Time resolution** (controls n_t for the signal-pass)")
+    tr_a, tr_b = st.columns([1, 2])
+    with tr_a:
+        time_resolution = st.selectbox(
+            "Resolution preset",
+            ["low", "standard", "fine"],
+            index=1,
+            help=(
+                "low: 20 pts/chirped pulse, 4 pts/pulse spacing (fastest, ~4–6× faster). "
+                "standard: 80/16 (legacy default). "
+                "fine: 160/32 (most accurate, slowest)."
+            ),
         )
-    with rep_col2:
-        rep_rate_khz = st.number_input("Rep rate (kHz)", 0.1, 10_000.0, 100.0, 1.0)
-    with rep_col3:
-        n_periods = st.number_input("Periods to simulate", 5, 200, 40, 1)
-
-    steady_tol = st.slider("Steady-state tolerance", 0.001, 0.1, 0.02, 0.001, format="%.3f")
+    with tr_b:
+        try:
+            _tr_preview = time_resolution_preset(time_resolution)
+            _burst_start_prev = (
+                1.0 / (rep_rate_khz * 1e3)
+                if (rep_rate_mode and pump_cw_run)
+                else burst_start_us * 1e-6
+            )
+            _pump_dur_prev = pump_dur_ms_run * 1e-3 if pump_cw_run else pump_dur_us_run * 1e-6
+            _, _, _n_t_one = recommend_time_grid(
+                pump_duration_s=_pump_dur_prev,
+                burst_span_s=(int(burst_n) - 1) * float(burst_sp_ns) * 1e-9,
+                chirped_pulse_duration_s=float(chirp_ns_run) * 1e-9,
+                burst_count=int(burst_n),
+                burst_spacing_s=float(burst_sp_ns) * 1e-9,
+                burst_start_time_s=_burst_start_prev,
+                points_per_chirped_pulse=_tr_preview["points_per_chirped_pulse"],
+                points_per_burst_spacing=_tr_preview["points_per_burst_spacing"],
+            )
+            uses_warmup = bool(rep_rate_mode and pump_cw_run and steady_state_warmup)
+            multiplier = 1 if uses_warmup or not rep_rate_mode else max(1, int(n_periods))
+            n_t_est = _n_t_one * multiplier
+            st.caption(
+                f"Estimated n_t ≈ {n_t_est:,}  "
+                f"(preset → {_tr_preview['points_per_chirped_pulse']} pts/chirp, "
+                f"{_tr_preview['points_per_burst_spacing']} pts/spacing"
+                + (
+                    f"; ×{multiplier} periods — disable warmup to resolve every period"
+                    if multiplier > 1
+                    else ("; warmup ON → 1 period time-resolved" if uses_warmup else "")
+                )
+                + ")"
+            )
+        except Exception:
+            pass
 
     st.markdown("**Passive delivery fiber (B-integral)**")
     b_col1, b_col2 = st.columns(2)
@@ -469,6 +623,9 @@ with tab_run:
             pump_absorption_db_per_m=pump_abs_db_per_m,
             total_absorption_db=total_abs_db,
             pump_wavelength_nm=pump_wl_nm,
+            simulation_pump_wavelength_nm=(
+                None if sim_pump_match else float(sim_pump_wl_nm)
+            ),
             yb_concentration_override_m3=yb_n,
             pump_peak_power_w=pump_peak_w,
             pump_cw=pump_cw_run,
@@ -477,7 +634,7 @@ with tab_run:
             signal_center_nm=sig_center_run,
             signal_bandwidth_nm=sig_bw_run,
             chirp_duration_s=chirp_ns_run * 1e-9,
-            energy_per_pulse_j=pulse_energy_uj * 1e-6,
+            packet_energy_j=packet_energy_uj * 1e-6,
             burst_count=int(burst_n),
             burst_spacing_s=burst_sp_ns * 1e-9,
             burst_start_s=burst_start_us * 1e-6,
@@ -493,6 +650,8 @@ with tab_run:
             passive_fiber_before_m=float(passive_before_m),
             passive_fiber_after_m=float(passive_after_m),
             pulse_relative_powers=pulse_weights,
+            time_resolution=time_resolution,
+            steady_state_warmup=bool(steady_state_warmup),
         )
 
         plot_spec = ChirpedBurstSpec(
@@ -518,6 +677,8 @@ with tab_run:
         outcome = run_simulation(inp, progress_callback=_on_progress)
         progress_bar.progress(1.0, text="100% — Done")
         progress_caption.markdown("**100%** — Simulation complete")
+        st.session_state["last_sim_outcome"] = outcome
+        st.session_state["last_sim_inputs"] = inp
 
         if not outcome.ok:
             st.error(f"Simulation failed: **{outcome.error_type}** — {outcome.error_message}")
@@ -534,6 +695,7 @@ with tab_run:
                 + (f" · wall time **{outcome.wall_time_s:.2f} s**" if outcome.wall_time_s else "")
             )
         st.text(format_energy_summary(outcome))
+        _render_flat_packet_weights_ui(outcome, button_key="apply_flat_weights_run")
         cw_line = format_cw_reference_summary(outcome)
         if cw_line:
             st.info(cw_line)
@@ -578,14 +740,97 @@ with tab_run:
 
         st.subheader("Cross sections (material model)")
         st.plotly_chart(build_cross_section_figure(result), use_container_width=True)
-        st.caption(
-            f"Pump: σ_abs = {result.sigma_abs_pump_m2:.3e} m² @ {result.pump_wavelength_nm:.1f} nm. "
+        _pump_cap = (
+            f"Pump (simulation): σ_abs = {result.sigma_abs_pump_m2:.3e} m² @ "
+            f"{result.pump_wavelength_nm:.1f} nm. "
+        )
+        if abs(result.pump_wavelength_nm - pump_wl_nm) > 0.5:
+            _pump_cap += f"N calc used {pump_wl_nm:.1f} nm. "
+        _pump_cap += (
             "N = κ/(Γ_p·σ); z depletion uses α_p = Γ_p·σ·N₀ (core size affects Γ_p and N)."
         )
+        st.caption(_pump_cap)
 
         z, t, wl = result.z_m, result.t_s, result.wavelength_nm
         sig_in = result.signal_fwd_w_nm[0]
         sig_out = result.signal_fwd_w_nm[-1]
+
+        plot_spec = resolve_plot_spec_from_signal(
+            t,
+            sig_in,
+            wl,
+            outcome.signal_spec if outcome.signal_spec is not None else plot_spec,
+        )
+
+        if outcome.warmup_result is not None and outcome.warmup_result.e_out_per_iter_j.size:
+            w = outcome.warmup_result
+            iters = np.arange(1, w.e_out_per_iter_j.size + 1)
+            st.subheader("Steady-state warmup (lumped per-period energy)")
+            wc1, wc2 = st.columns(2)
+            with wc1:
+                fig_we = go.Figure()
+                fig_we.add_trace(
+                    go.Scatter(
+                        x=iters,
+                        y=w.e_out_per_iter_j * 1e6,
+                        mode="lines+markers",
+                        name="Packet E_out (µJ)",
+                    )
+                )
+                fig_we.add_hline(
+                    y=w.e_packet_in_j * 1e6,
+                    line_dash="dash",
+                    line_color="gray",
+                    annotation_text="E_in",
+                )
+                fig_we.update_layout(
+                    title="Warmup packet energy per iteration",
+                    xaxis_title="Iteration",
+                    yaxis_title="Energy (µJ)",
+                    height=340,
+                )
+                st.plotly_chart(fig_we, use_container_width=True)
+            with wc2:
+                fig_wg = go.Figure()
+                fig_wg.add_trace(
+                    go.Scatter(
+                        x=iters,
+                        y=w.gain_per_iter,
+                        mode="lines+markers",
+                        name="Gain E_out/E_in",
+                    )
+                )
+                fig_wg.add_trace(
+                    go.Scatter(
+                        x=iters,
+                        y=w.residual_per_iter,
+                        mode="lines+markers",
+                        name="N₂ residual",
+                        yaxis="y2",
+                    )
+                )
+                fig_wg.update_layout(
+                    title="Warmup gain & inversion residual",
+                    xaxis_title="Iteration",
+                    yaxis=dict(title="Packet gain"),
+                    yaxis2=dict(
+                        title="‖ΔN₂‖/‖N₂‖",
+                        overlaying="y",
+                        side="right",
+                        type="log"
+                        if float(np.max(w.residual_per_iter)) > 1e-12
+                        else "linear",
+                    ),
+                    height=340,
+                )
+                st.plotly_chart(fig_wg, use_container_width=True)
+            st.caption(
+                f"Lumped Frantz–Nodvik extraction + pump rebuild @ "
+                f"{result.rep_rate_hz / 1e3:.2f} kHz. "
+                f"Final: {w.e_packet_out_j * 1e6:.4f} µJ out, "
+                f"gain {w.e_packet_out_j / max(w.e_packet_in_j, 1e-30):.3f}, "
+                f"G₀ ≈ {w.small_signal_gain_db:.2f} dB."
+            )
 
         fig_pump = go.Figure()
         fig_pump.add_trace(
@@ -691,3 +936,9 @@ with tab_run:
             else ""
         )
         st.plotly_chart(build_small_signal_gain_vs_z_figure(result), use_container_width=True)
+
+    # Persist equalization UI from last successful run (survives Streamlit reruns).
+    _last_out = st.session_state.get("last_sim_outcome")
+    if _last_out is not None and getattr(_last_out, "ok", False):
+        with st.expander("Packet equalization (last run)", expanded=False):
+            _render_flat_packet_weights_ui(_last_out, button_key="apply_flat_weights_last")

@@ -22,7 +22,7 @@ class ChirpedBurstSpec:
     center_wavelength_nm: float = 1030.0
     bandwidth_nm: float = 8.0
     chirp_duration_s: float = 1e-9  # stretched pulse ~1 ns+
-    energy_per_pulse_j: float = 1e-6
+    packet_energy_j: float = 10e-6
     burst_count: int = 5  # pulses per packet (typical CPA train)
     burst_spacing_s: float = DEFAULT_BURST_SPACING_S
     burst_start_time_s: float = 0.0  # delay first burst after pump turn-on
@@ -41,7 +41,7 @@ class ChirpedBurstSpec:
     def __post_init__(self) -> None:
         self.burst_spacing_s = max(float(self.burst_spacing_s), MIN_BURST_SPACING_S)
         self.burst_count = int(np.clip(self.burst_count, 1, 50))
-        self.n_periods = int(np.clip(self.n_periods, 3, 500))
+        self.n_periods = int(np.clip(self.n_periods, 1, 500))
         self.rep_rate_hz = max(float(self.rep_rate_hz), 1.0)
         if self.pulse_relative_powers is not None:
             arr = tuple(float(x) for x in self.pulse_relative_powers)
@@ -52,6 +52,11 @@ class ChirpedBurstSpec:
             if any(x < 0 for x in arr):
                 raise ValueError("pulse_relative_powers must be non-negative")
             self.pulse_relative_powers = arr
+
+    @property
+    def energy_per_pulse_j(self) -> float:
+        """Backwards-compat: energy of a single flat pulse = packet_energy_j / burst_count."""
+        return self.packet_energy_j / max(self.burst_count, 1)
 
 
 def packet_time_extent_s(spec: ChirpedBurstSpec) -> float:
@@ -66,8 +71,8 @@ def packet_duration_s(spec: ChirpedBurstSpec) -> float:
 
 
 def packet_energy_expected_j(spec: ChirpedBurstSpec) -> float:
-    """Total energy in one packet (J) = N_pulses × E_per_pulse."""
-    return float(spec.burst_count) * float(spec.energy_per_pulse_j)
+    """Total energy in one packet (J)."""
+    return float(spec.packet_energy_j)
 
 
 def first_pulse_center_time_s(spec: ChirpedBurstSpec) -> float:
@@ -90,7 +95,7 @@ def chirp_sigma_t_s(spec: ChirpedBurstSpec) -> float:
 def _get_pulse_weights(spec: ChirpedBurstSpec) -> np.ndarray:
     """
     Return per-pulse energy weights, normalized so mean = 1.0.
-    Preserves total packet energy = burst_count * energy_per_pulse_j.
+    Preserves total packet energy = packet_energy_j (mean weight 1 → sum(weights)=burst_count).
     """
     n = int(np.clip(spec.burst_count, 1, 50))
     if spec.pulse_relative_powers is None:
@@ -282,7 +287,8 @@ def build_chirped_signal(
             center_wavelength_nm=spec.center_wavelength_nm,
             bandwidth_nm=spec.bandwidth_nm,
             chirp_duration_s=spec.chirp_duration_s,
-            energy_per_pulse_j=spec.energy_per_pulse_j,
+            packet_energy_j=spec.packet_energy_j,
+            pulse_relative_powers=spec.pulse_relative_powers,
             burst_count=spec.burst_count,
             burst_spacing_s=spec.burst_spacing_s,
             burst_start_time_s=t0,
@@ -302,7 +308,7 @@ def build_chirped_burst(
     """
     Build signal power spectral density P_s(t, λ) in W/nm.
 
-    Each chirped pulse uses ``energy_per_pulse_j * weight[b]`` with weights from
+    Each chirped pulse uses ``packet_energy_j * weight[b] / burst_count`` with weights from
     ``_get_pulse_weights`` (mean 1 → total packet energy preserved). Pulses are
     superposed in time: overlapping envelopes **add in intensity** (incoherent
     sum of power density), not in field amplitude.
@@ -324,7 +330,7 @@ def build_chirped_burst(
     # Gaussian in time: ∫ P(t) dt = E_pulse with σ_t (FWHM = chirp_duration_s).
     for b in range(burst_count):
         t_burst0 = spec.burst_start_time_s + b * spacing
-        e_pulse_b = spec.energy_per_pulse_j * weights[b]
+        e_pulse_b = spec.packet_energy_j * weights[b] / max(spec.burst_count, 1)
         for j in range(nw):
             t_center = t_burst0 + delays[j]
             envelope = np.exp(-0.5 * ((time_s - t_center) / sigma_t) ** 2)
@@ -356,6 +362,33 @@ def build_pump_power(time_s: np.ndarray, spec: PumpPulseSpec) -> np.ndarray:
         p = np.where((t >= 0) & (t <= dur), spec.peak_power_w, 0.0)
 
     return np.maximum(p, 0.0)
+
+
+_TIME_RES_PRESETS: dict[str, dict[str, int]] = {
+    "low": {
+        "points_per_chirped_pulse": 20,
+        "points_per_burst_spacing": 4,
+        "points_pump_coarse": 120,
+    },
+    "standard": {
+        "points_per_chirped_pulse": 80,
+        "points_per_burst_spacing": 16,
+        "points_pump_coarse": 400,
+    },
+    "fine": {
+        "points_per_chirped_pulse": 160,
+        "points_per_burst_spacing": 32,
+        "points_pump_coarse": 800,
+    },
+}
+
+
+def time_resolution_preset(name: str) -> dict[str, int]:
+    """Return grid-density parameters for a named resolution preset."""
+    key = (name or "standard").lower()
+    if key not in _TIME_RES_PRESETS:
+        key = "standard"
+    return dict(_TIME_RES_PRESETS[key])
 
 
 def build_cpa_time_grid(
@@ -433,7 +466,8 @@ def build_rep_rate_time_grid(
             center_wavelength_nm=spec.center_wavelength_nm,
             bandwidth_nm=spec.bandwidth_nm,
             chirp_duration_s=spec.chirp_duration_s,
-            energy_per_pulse_j=spec.energy_per_pulse_j,
+            packet_energy_j=spec.packet_energy_j,
+            pulse_relative_powers=spec.pulse_relative_powers,
             burst_count=spec.burst_count,
             burst_spacing_s=spec.burst_spacing_s,
             burst_start_time_s=spec.burst_start_time_s + k * t_rep,

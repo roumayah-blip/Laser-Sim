@@ -123,6 +123,8 @@ def run_pump_pass_taichi(
     backward_pump: bool,
     backward_fraction: float,
     progress_callback: ProgressCallback | None = None,
+    initial_n2_fraction: float = 0.0,
+    initial_n2_fraction_z: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Pump pass: causal QSS march on CPU (CUDA cannot run the long serial-in-t kernel),
@@ -153,6 +155,8 @@ def run_pump_pass_taichi(
         progress_callback=progress_callback,
         progress_base=0.05,
         progress_span=0.28,
+        initial_n2_fraction=initial_n2_fraction,
+        initial_n2_fraction_z=initial_n2_fraction_z,
     )
 
 
@@ -183,16 +187,17 @@ def run_signal_pass_taichi(
     eta_guided: float,
     lifetimes: FourLevelLifetimes,
     include_ase: bool,
+    burst_start_time_s: float = 0.0,
     progress_callback: ProgressCallback | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Causal signal pass on CPU (RK4 substeps, pump coupling); optional GPU ASE sweep.
+    Causal signal + coupled ASE on CPU (populations depleted by signal and ASE).
     """
     from laser_sim.physics.fiber_cpa import _signal_pass
 
     nz, nt, nlam = z.size, t.size, wl.size
     n1 = np.zeros_like(n0)
-    p_s, p_ase_f, p_ase_b, n0, n1, n2, n3 = _signal_pass(
+    return _signal_pass(
         z=z,
         t=t,
         wl=wl,
@@ -218,84 +223,11 @@ def run_signal_pass_taichi(
         a_pump=a_pump,
         eta_guided=eta_guided,
         lifetimes=lifetimes,
-        include_ase=False,
+        include_ase=include_ase,
+        burst_start_time_s=burst_start_time_s,
         progress_callback=progress_callback,
         progress_base=0.38,
-        progress_span=0.40 if include_ase else 0.54,
-    )
-
-    if not include_ase:
-        return p_s, p_ase_f, p_ase_b, n0, n1, n2, n3
-
-    tk._cache.ensure(nz, nt, nlam)
-    _upload_spectral(wl, sigma_a, sigma_e, hnu)
-    n0f, n2f, n3f = _sanitize_population_fractions(n0, n2, n3, n_tot)
-    tk._cache.n0.from_numpy(n0f)
-    tk._cache.n2.from_numpy(n2f)
-    tk._cache.n3.from_numpy(n3f)
-    tk._cache.p_sig.from_numpy(p_s.astype(np.float32))
-
-    p_ase = np.zeros((nz, nt, nlam), dtype=np.float32)
-    tk._cache.p_ase_f.from_numpy(p_ase)
-    tk._cache.p_ase_b.from_numpy(p_ase)
-
-    n_tot_f = np.float32(n_tot)
-    sigma_e_norm = float(np.trapezoid(sigma_e, wl))
-    if sigma_e_norm <= 0:
-        sigma_e_norm = float(np.sum(sigma_e)) or 1.0
-    tau_21 = lifetimes.tau_21_s
-
-    n_steps = max(nz - 1, 1)
-    ase_stages = 2 * n_steps
-    total_stages = ase_stages
-
-    def _stage_progress(stage_idx: int, label: str) -> None:
-        frac = 0.78 + 0.14 * (stage_idx / max(total_stages, 1))
-        emit_progress(progress_callback, frac, label)
-
-    stage = 0
-    if include_ase:
-        ase_zero = np.zeros((nz, nt, nlam), dtype=np.float32)
-        tk._cache.p_ase_f.from_numpy(ase_zero)
-        tk._cache.p_ase_b.from_numpy(ase_zero)
-        for iz in range(nz - 1):
-            _stage_progress(stage, f"ASE fwd: z {iz + 1}/{nz - 1}")
-            stage += 1
-            tk.kernel_compute_gain(iz, np.float32(gamma_s), n_tot_f)
-            tk.kernel_spontaneous_source(
-                iz,
-                np.float32(eta_guided),
-                np.float32(gamma_s),
-                np.float32(tau_21),
-                np.float32(sigma_e_norm),
-                n_tot_f,
-            )
-            tk.kernel_ase_fwd_slab(iz, np.float32(dz))
-        for iz in range(nz - 2, -1, -1):
-            _stage_progress(stage, f"ASE bwd: z {iz + 1}/{nz - 1}")
-            stage += 1
-            tk.kernel_compute_gain(iz, np.float32(gamma_s), n_tot_f)
-            tk.kernel_spontaneous_source(
-                iz,
-                np.float32(eta_guided),
-                np.float32(gamma_s),
-                np.float32(tau_21),
-                np.float32(sigma_e_norm),
-                n_tot_f,
-            )
-            tk.kernel_ase_bwd_slab(iz, np.float32(dz))
-
-        # Do not re-run RK4 with ASE power coupling: populations stay from CPU signal pass.
-
-    tk.ti.sync()
-    return (
-        p_s,
-        tk._cache.p_ase_f.to_numpy().astype(np.float64),
-        tk._cache.p_ase_b.to_numpy().astype(np.float64),
-        n0,
-        n1,
-        n2,
-        n3,
+        progress_span=0.54,
     )
 
 
@@ -354,15 +286,26 @@ def run_fiber_cpa_taichi(
 
     tk._cache.ensure(nz, nt, nlam)
     p_p_in = build_pump_power(t, cfg.pump)
+    from laser_sim.physics.four_level import pump_rate_per_ion, steady_state_n2_fraction_pump
+
     peak_pump_w = float(np.max(p_p_in)) if p_p_in.size else cfg.pump.peak_power_w
     i_p_peak = peak_pump_w / a_pump
-    w_p_abs_peak = gamma_p * sigma_p * i_p_peak / hnu_p
-    saturation_param = w_p_abs_peak * lifetimes.tau_21_s
-    if saturation_param < 0.1:
+    w_p_abs_peak, w_p_esa_peak = pump_rate_per_ion(
+        i_p_peak, sigma_p=sigma_p, sigma_ep=sigma_ep, hnu_p=hnu_p
+    )
+    n2_ss_peak = steady_state_n2_fraction_pump(
+        w_p_abs_peak, w_p_esa_peak, lifetimes.tau_21_s
+    )
+    sig_idx = int(np.argmin(np.abs(wl - cfg.signal.center_wavelength_nm)))
+    beta_t = float(
+        sigma_a[sig_idx] / (sigma_a[sig_idx] + sigma_e[sig_idx] + 1e-30)
+    )
+    if n2_ss_peak < beta_t:
+        p_sat = hnu_p * a_pump / (sigma_p * lifetimes.tau_21_s)
         warnings.warn(
-            f"Pump saturation parameter W_p·τ₂₁ = {saturation_param:.4f} << 1. "
-            f"Peak inversion will be ≈{saturation_param/(1+saturation_param)*100:.2f}% "
-            f"— fiber is below transparency.",
+            f"Pump-only steady-state N₂/N_tot ≈ {n2_ss_peak*100:.1f}% at peak pump "
+            f"({peak_pump_w:.2g} W), below signal transparency β_t ≈ {beta_t*100:.2f}% "
+            f"at {cfg.signal.center_wavelength_nm:.0f} nm (P_sat_clad ≈ {p_sat:.2f} W).",
             stacklevel=2,
         )
 
@@ -387,6 +330,8 @@ def run_fiber_cpa_taichi(
         backward_pump=cfg.backward_pump,
         backward_fraction=cfg.backward_pump_fraction,
         progress_callback=progress_callback,
+        initial_n2_fraction=cfg.initial_n2_fraction,
+        initial_n2_fraction_z=cfg.initial_n2_fraction_z,
     )
 
     pops_after_pump = populations_to_fractions(
@@ -428,6 +373,7 @@ def run_fiber_cpa_taichi(
         eta_guided=eta_guided,
         lifetimes=lifetimes,
         include_ase=cfg.include_ase,
+        burst_start_time_s=cfg.signal.burst_start_time_s,
         progress_callback=progress_callback,
     )
 
@@ -461,12 +407,44 @@ def run_fiber_cpa_taichi(
     e_pkt_out = integrate_packet_energy(p_s[-1], t, wl, cfg.signal)
     e_pls_in = integrate_single_pulse_energy(p_s[0], t, wl, cfg.signal, pulse_index=0)
     e_pls_out = integrate_single_pulse_energy(p_s[-1], t, wl, cfg.signal, pulse_index=0)
+    n_burst = int(cfg.signal.burst_count)
+    pulse_e_in = np.array(
+        [
+            integrate_single_pulse_energy(p_s[0], t, wl, cfg.signal, pulse_index=b)
+            for b in range(n_burst)
+        ]
+    )
+    pulse_e_out = np.array(
+        [
+            integrate_single_pulse_energy(p_s[-1], t, wl, cfg.signal, pulse_index=b)
+            for b in range(n_burst)
+        ]
+    )
     e_ase = (
         integrate_packet_energy(p_ase_f[-1] + p_ase_b[0], t, wl, cfg.signal)
         if cfg.include_ase
         else 0.0
     )
     e_pump_abs_frac = 1.0 - e_pump_out / max(e_pump_in, 1e-30)
+
+    from laser_sim.physics.energy_budget import compute_amplifier_energy_budget
+
+    budget = compute_amplifier_energy_budget(
+        t_s=t,
+        z_m=z,
+        populations=pops,
+        wavelength_nm=wl,
+        n_tot=n_tot,
+        tau_21_s=lifetimes.tau_21_s,
+        a_signal_m2=a_signal,
+        eta_guided=eta_guided,
+        gamma_s=gamma_s,
+        energy_pump_in_j=e_pump_in,
+        energy_pump_out_j=e_pump_out,
+        energy_packet_in_j=e_pkt_in,
+        energy_packet_out_j=e_pkt_out,
+        energy_ase_out_j=e_ase,
+    )
 
     lp_note = ""
     if lp_modes_list:
@@ -514,8 +492,16 @@ def run_fiber_cpa_taichi(
         energy_packet_out_j=e_pkt_out,
         energy_packet_expected_j=e_pkt_expected,
         energy_ase_out_j=e_ase,
+        energy_unguided_spont_j=budget.spontaneous_unguided_j,
+        energy_balance_ok=budget.balance_ok,
+        energy_balance_residual_j=budget.balance_residual_j,
+        ase_fraction_of_emission=budget.ase_fraction_of_emission,
         pump_power_absorbed_fraction=e_pump_abs_frac,
-        notes=notes,
+        notes=notes
+        + (
+            f" ASE frac={budget.ase_fraction_of_emission*100:.1f}% of emission; "
+            f"balance={'OK' if budget.balance_ok else 'OVER'}."
+        ),
         steady_state_reached=ss_ok,
         steady_state_metric=ss_metric,
         rep_rate_hz=cfg.signal.rep_rate_hz if cfg.signal.rep_rate_mode else None,
@@ -526,6 +512,9 @@ def run_fiber_cpa_taichi(
         eta_guided_spontaneous=eta_guided,
         v_number=v_no,
         signal_mode_area_m2=a_signal,
+        a_signal_m2=a_signal,
+        pulse_energies_in_j=pulse_e_in,
+        pulse_energies_out_j=pulse_e_out,
         g0_small_signal_np_m=g0_np,
         g0_small_signal_db_m=g0_db,
         lp_modes=lp_modes_list,

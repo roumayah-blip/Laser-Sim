@@ -22,6 +22,7 @@ FIBER_PRESET_FIELDS = (
     "pump_absorption_db_per_m",
     "total_absorption_db",
     "pump_wavelength_nm",
+    "simulation_pump_wavelength_nm",
 )
 
 
@@ -98,6 +99,7 @@ def preset_to_session_updates(payload: dict[str, Any]) -> dict[str, Any]:
         "pump_absorption_db_per_m": "pump_abs_db_per_m",
         "total_absorption_db": "total_abs_db",
         "pump_wavelength_nm": "pump_wl_nm",
+        "simulation_pump_wavelength_nm": "sim_pump_wl_nm",
     }
     for src, dst in mapping.items():
         if src in payload:

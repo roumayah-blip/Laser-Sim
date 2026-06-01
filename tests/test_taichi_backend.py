@@ -45,7 +45,7 @@ def _pump_absorption_cfg(*, n_z: int = 150) -> FiberCPAConfig:
         center_wavelength_nm=1030.0,
         bandwidth_nm=4.0,
         chirp_duration_s=0.8e-9,
-        energy_per_pulse_j=1e-6,
+        packet_energy_j=1e-6,
         burst_start_time_s=200e-6,
     )
     t = build_cpa_time_grid(pump_duration_s=500e-6, spec=sig, pump_cw=True)
@@ -99,7 +99,7 @@ def _cw_gain_cfg(*, n_z: int = 60) -> FiberCPAConfig:
         center_wavelength_nm=1030.0,
         bandwidth_nm=8.0,
         chirp_duration_s=0.8e-9,
-        energy_per_pulse_j=1e-6,
+        packet_energy_j=1e-6,
         burst_count=5,
         burst_spacing_s=2.5e-9,
         burst_start_time_s=200e-6,

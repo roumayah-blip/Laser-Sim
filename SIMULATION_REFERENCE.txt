@@ -132,12 +132,13 @@ Signal propagation (Pass B):
     P_s(z+Δz) = P_s(z)·exp(g·Δz)
     Populations at zᵢ₊₁ from pump pass (vary with depleted pump along z).
 
-Spontaneous emission & ASE:
+Spontaneous emission & ASE (coupled to populations):
 
-    Total decay N₂ → N₀ at rate 1/τ₂₁ (material.lifetime_s, default 896 µs).
-    Fraction η_guided = V²/(V²+2),  V = (2π/λ)·r_core·NA  (guided LP₀₁).
-    ASE source (W/nm): η · Γ_s · (N₂/τ₂₁) · hν·σ_em / ∫σ_em dλ
-    Added to forward/backward ASE bins and amplified with g·Δz.
+    dn₂/dt includes −N₂/τ₂₁ (all spontaneous decay depletes inversion).
+    Guided fraction f_g = η_guided·Γ_s of that decay seeds ASE at local N₂(z,t).
+    Stimulated rates W_se, W_abs from signal AND ASE power (incoherent sum in RK4).
+    Per z-slab: ASE_fwd/bwd with g(N₀,N₂); then RK4 over Δt_travel with ASE-only W_se.
+    Energy budget: E_emit = E_sig_net + E_ASE + E_unguided ≤ E_pump_absorbed.
 
 ================================================================================
 6. PUMP ABSORPTION — HOW IT WORKS & RECENT FIX
@@ -278,9 +279,32 @@ chirp.py:
   build_chirped_burst() — Gaussian chirped pulses, incoherent sum if overlap
   build_pump_power() — flat_top, gaussian, trapezoid, CW
   rep_rate_mode — periodic packets for steady-state analysis
+  time_resolution_preset(name) — "low" / "standard" / "fine"; sets
+      points_per_chirped_pulse, points_per_burst_spacing, points_pump_coarse.
+      "low" cuts n_t ~3–4× vs "standard"; "fine" doubles it.
 
 Default packet (GUI): 0.8 ns chirp, 2.5 ns spacing, 5 pulses
 Default burst delay: 200 µs (pump builds inversion before packet)
+
+REP-RATE STEADY STATE — two solver paths:
+  (a) Legacy (steady_state_warmup=False):
+        Time-resolve all n_periods periods; full causal march walks through
+        the startup transient. n_t scales linearly with n_periods.
+  (b) RP-Fiber-Power-style warmup (default, steady_state_warmup=True):
+        rep_rate_warmup.solve_rep_rate_steady_state_inversion() runs a CPU-
+        only fixed-point iteration on a single representative packet:
+          1. Pulse extraction along z (Frantz–Nodvik per slab):
+               E_out_slab = E_sat·ln(1 + (exp(E_in/E_sat) − 1)·exp(g₀·dz))
+               g₀ = Γ_s·(σ_e·N₂ − σ_a·N₀)
+               ΔN₂ per slab = (E_out − E_in) / (A_sig·dz·hν_s)
+          2. Pump rebuild for T_rep (no signal) with effective time constant
+               τ_eff = 1/(1/τ₂₁ + W_p)
+               N₂(after) = N₂_ss + (N₂_post − N₂_ss)·exp(−T_rep/τ_eff)
+          3. Iterate until ‖N₂_pre − N₂_pre_prev‖ < tol.
+        The converged N₂(z) is plumbed in as a per-z initial condition
+        (FiberCPAConfig.initial_n2_fraction_z) and only ONE time-resolved
+        packet period is simulated. Typical speedup: 5–18× depending on
+        n_periods and the time_resolution preset.
 
 ================================================================================
 11. GUI & RUN PIPELINE

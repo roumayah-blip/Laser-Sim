@@ -31,13 +31,13 @@ def test_overlapping_pulses_sum_intensity():
         burst_count=1,
         chirp_duration_s=chirp,
         burst_spacing_s=spacing,
-        energy_per_pulse_j=1e-6,
+        packet_energy_j=1e-6,
     )
     two = ChirpedBurstSpec(
         burst_count=2,
         chirp_duration_s=chirp,
         burst_spacing_s=spacing,
-        energy_per_pulse_j=1e-6,
+        packet_energy_j=2e-6,
     )
     p1 = build_chirped_burst(t, wl, one)
     p2 = build_chirped_burst(t, wl, two)

@@ -28,10 +28,12 @@ from laser_sim.materials.base import Material
 from laser_sim.gui.backend_status import normalize_sim_backend
 from laser_sim.physics.fiber_cpa import FiberCPAConfig, FiberCPAResult, run_fiber_cpa
 from laser_sim.physics.progress import ProgressCallback
+from laser_sim.physics.rep_rate_warmup import RepRateWarmupResult
 from laser_sim.pulses.chirp import (
     ChirpedBurstSpec,
     PumpPulseSpec,
     build_cpa_time_grid,
+    time_resolution_preset,
 )
 
 
@@ -47,7 +49,8 @@ class SimInputs:
     abs_mode_db_per_m: bool = True
     pump_absorption_db_per_m: float = 6.0
     total_absorption_db: float = 12.0
-    pump_wavelength_nm: float = 976.0
+    pump_wavelength_nm: float = 976.0  # datasheet λ for N from κ (dB/m); not the sim pump unless matched
+    simulation_pump_wavelength_nm: float | None = None  # physics pump λ; None → use pump_wavelength_nm
     yb_concentration_m3: float | None = None  # deprecated: use yb_concentration_override_m3
     yb_concentration_override_m3: float | None = None
     # When set, used as N_tot regardless of pump geometry or pump_absorption_db_per_m.
@@ -60,7 +63,7 @@ class SimInputs:
     signal_center_nm: float = 1030.0
     signal_bandwidth_nm: float = 8.0
     chirp_duration_s: float = 0.8e-9
-    energy_per_pulse_j: float = 1e-6
+    packet_energy_j: float = 10e-6
     burst_count: int = 5
     burst_spacing_s: float = 2.5e-9
     burst_start_s: float = 200e-6
@@ -70,6 +73,8 @@ class SimInputs:
     rep_rate_hz: float = 100e3
     n_periods: int = 40
     steady_state_tol: float = 0.02
+    time_resolution: str = "standard"           # "low" | "standard" | "fine"
+    steady_state_warmup: bool = True            # RP-style lumped pre-iteration for rep-rate CW
     export_diagnostics: bool = False
     cw_signal_average_power: bool = False
     backend: str = "cuda"
@@ -96,6 +101,25 @@ class SimRunOutcome:
     taichi_arch: str | None = None
     wall_time_s: float | None = None
     b_integral: object | None = None
+    packet_energy_target_j: float | None = None
+    suggested_flat_weights: list[float] | None = None
+    n_t: int | None = None
+    n_lambda: int | None = None
+    time_resolution: str | None = None
+    steady_state_warmup_used: bool = False
+    steady_state_warmup_iter: int | None = None
+    steady_state_warmup_residual: float | None = None
+    steady_state_warmup_converged: bool | None = None
+    warmup_result: RepRateWarmupResult | None = None
+    signal_spec: ChirpedBurstSpec | None = None
+    pump_wavelength_datasheet_nm: float | None = None
+
+
+def simulation_pump_wavelength_nm(inp: SimInputs) -> float:
+    """Pump wavelength used in the CPA simulation (validated against material σ table)."""
+    if inp.simulation_pump_wavelength_nm is not None:
+        return float(inp.simulation_pump_wavelength_nm)
+    return float(inp.pump_wavelength_nm)
 
 
 def _resolve_dopant(inp: SimInputs, material: Material):
@@ -130,6 +154,10 @@ def run_simulation(
 
         backend_used = normalize_sim_backend(inp.backend)
         material = load_material(inp.material_key)
+        sim_pump_nm = simulation_pump_wavelength_nm(inp)
+        from laser_sim.materials.base import require_pump_cross_sections
+
+        require_pump_cross_sections(material, sim_pump_nm)
         n_override = inp.yb_concentration_override_m3
         if n_override is None and inp.yb_concentration_m3 is not None:
             n_override = inp.yb_concentration_m3
@@ -146,7 +174,7 @@ def run_simulation(
 
         pump_shape = "cw" if inp.pump_cw else inp.pump_shape
         pump_spec = PumpPulseSpec(
-            wavelength_nm=inp.pump_wavelength_nm,
+            wavelength_nm=sim_pump_nm,
             peak_power_w=inp.pump_peak_power_w,
             duration_s=inp.pump_duration_s,
             shape=pump_shape,
@@ -158,17 +186,28 @@ def run_simulation(
         if inp.pulse_relative_powers is not None:
             prp = tuple(float(x) for x in inp.pulse_relative_powers)
 
+        burst_start_s = inp.burst_start_s
+        if inp.rep_rate_mode and inp.pump_cw:
+            burst_start_s = 1.0 / inp.rep_rate_hz
+
+        use_warmup = bool(inp.rep_rate_mode and inp.pump_cw and inp.steady_state_warmup)
+        # When warmup is active, we still tag the run as rep-rate (so diagnostics and
+        # downstream consumers know rep_rate_hz) but only simulate ONE period
+        # time-resolved; the steady-state transient is handled by the lumped warmup.
+        sig_rep_rate_mode = inp.rep_rate_mode
+        sig_n_periods = 1 if use_warmup else inp.n_periods
+
         sig_spec = ChirpedBurstSpec(
             center_wavelength_nm=inp.signal_center_nm,
             bandwidth_nm=inp.signal_bandwidth_nm,
             chirp_duration_s=inp.chirp_duration_s,
-            energy_per_pulse_j=inp.energy_per_pulse_j,
+            packet_energy_j=inp.packet_energy_j,
             burst_count=inp.burst_count,
             burst_spacing_s=inp.burst_spacing_s,
-            burst_start_time_s=inp.burst_start_s,
-            rep_rate_mode=inp.rep_rate_mode,
+            burst_start_time_s=burst_start_s,
+            rep_rate_mode=sig_rep_rate_mode,
             rep_rate_hz=inp.rep_rate_hz,
-            n_periods=inp.n_periods,
+            n_periods=sig_n_periods,
             steady_state_tol=inp.steady_state_tol,
             pulse_relative_powers=prp,
         )
@@ -183,16 +222,154 @@ def run_simulation(
         if inp.rep_rate_mode:
             from laser_sim.pulses.chirp import packet_duration_s, rep_period_s
 
-            pump_window = max(
-                inp.pump_duration_s,
-                inp.burst_start_s + sig_spec.n_periods * rep_period_s(sig_spec) + packet_duration_s(sig_spec),
-            )
+            t_rep_value = rep_period_s(sig_spec)
+            pkt_dur = packet_duration_s(sig_spec)
+            if use_warmup:
+                # Warmup already provides the steady-state inversion, so the
+                # time-resolved pass only needs a short pre-roll + one period.
+                pre_roll = max(burst_start_s, 2 * t_rep_value)
+                pump_window = pre_roll + t_rep_value + pkt_dur
+            else:
+                pump_window = max(
+                    inp.pump_duration_s,
+                    burst_start_s
+                    + sig_spec.n_periods * t_rep_value
+                    + pkt_dur,
+                )
 
+        tr_preset = time_resolution_preset(inp.time_resolution)
+        # When warmup is active, treat the single time-resolved period like a normal
+        # CPA burst (non-rep-rate grid) so the coarse pump grid scales with the
+        # ~10 µs window instead of being inflated to 400 points across the period.
+        grid_spec = sig_spec
+        if use_warmup:
+            grid_spec = replace(sig_spec, rep_rate_mode=False)
         t = build_cpa_time_grid(
             pump_duration_s=pump_window,
-            spec=sig_spec,
+            spec=grid_spec,
             pump_cw=inp.pump_cw,
+            points_per_chirped_pulse=tr_preset["points_per_chirped_pulse"],
+            points_per_burst_spacing=tr_preset["points_per_burst_spacing"],
+            points_pump_coarse=tr_preset["points_pump_coarse"],
         )
+
+        # Geometry shared by warmup + main run
+        _r_core = inp.core_diameter_um / 2 * 1e-6
+        _r_clad = inp.cladding_diameter_um / 2 * 1e-6
+        _sigma_p = float(material.sigma_abs_at(sim_pump_nm)[0])
+        _sigma_ep = float(material.sigma_em_at(sim_pump_nm)[0])
+        _hnu_p = 6.626e-34 * 3e8 / (sim_pump_nm * 1e-9)
+        _hnu_s = 6.626e-34 * 3e8 / (inp.signal_center_nm * 1e-9)
+        if inp.cladding_pumped:
+            _gamma_p = (_r_core / _r_clad) ** 2 if _r_clad > _r_core else 1.0
+            _a_pump = np.pi * _r_clad**2
+        else:
+            _gamma_p = 1.0
+            _a_pump = np.pi * _r_core**2
+        _a_core = np.pi * _r_core**2
+        _tau21 = material.lifetime_s
+
+        initial_n2_fraction = 0.0
+        initial_n2_fraction_z = None
+        warmup_iter = None
+        warmup_residual = None
+        warmup_converged = None
+        warmup_notes = ""
+        warmup_result: RepRateWarmupResult | None = None
+
+        if inp.rep_rate_mode and inp.pump_cw and not use_warmup:
+            from laser_sim.physics.four_level import pump_rate_per_ion, steady_state_n2_fraction_pump
+
+            _i_p = inp.pump_peak_power_w / _a_pump
+            _w_abs, _w_esa = pump_rate_per_ion(
+                _i_p, sigma_p=_sigma_p, sigma_ep=_sigma_ep, hnu_p=_hnu_p
+            )
+            initial_n2_fraction = steady_state_n2_fraction_pump(
+                _w_abs, _w_esa, _tau21
+            )
+
+        if use_warmup:
+            from laser_sim.physics.rep_rate_warmup import (
+                cw_pump_power_along_z,
+                solve_rep_rate_steady_state_inversion,
+            )
+            from laser_sim.physics.modes import signal_overlap_gamma
+
+            _gamma_s_warm, _a_sig_warm, _ = signal_overlap_gamma(
+                _r_core, inp.signal_center_nm, inp.core_na
+            )
+            _sigma_a_s = float(material.sigma_abs_at(inp.signal_center_nm)[0])
+            _sigma_e_s = float(material.sigma_em_at(inp.signal_center_nm)[0])
+
+            z_warm = np.linspace(0.0, inp.fiber_length_m, max(inp.n_z, 10))
+            # Two passes: first with N0=N_tot, then refine pump with current N2 estimate.
+            p_pump_z = cw_pump_power_along_z(
+                z_m=z_warm,
+                pump_power_in_w=inp.pump_peak_power_w,
+                a_pump_m2=_a_pump,
+                sigma_p=_sigma_p,
+                gamma_p=_gamma_p,
+                n_tot=n_yb,
+            )
+            warm = solve_rep_rate_steady_state_inversion(
+                z_m=z_warm,
+                pump_power_z_w=p_pump_z,
+                a_pump_m2=_a_pump,
+                sigma_p=_sigma_p,
+                gamma_p=_gamma_p,
+                hnu_p=_hnu_p,
+                sigma_ep=_sigma_ep,
+                sigma_a_sig=_sigma_a_s,
+                sigma_e_sig=_sigma_e_s,
+                gamma_s=_gamma_s_warm,
+                a_signal_m2=_a_sig_warm,
+                hnu_s=_hnu_s,
+                packet_energy_j=inp.packet_energy_j,
+                rep_rate_hz=inp.rep_rate_hz,
+                tau_21_s=_tau21,
+                n_tot=n_yb,
+                progress_callback=progress_callback,
+                progress_base=0.02,
+                progress_span=0.20,
+            )
+            # Refine pump with steady-state N2 estimate then re-solve once.
+            p_pump_z = cw_pump_power_along_z(
+                z_m=z_warm,
+                pump_power_in_w=inp.pump_peak_power_w,
+                a_pump_m2=_a_pump,
+                sigma_p=_sigma_p,
+                gamma_p=_gamma_p,
+                n_tot=n_yb,
+                n2_estimate_z=warm.n2_pre_packet,
+            )
+            warm = solve_rep_rate_steady_state_inversion(
+                z_m=z_warm,
+                pump_power_z_w=p_pump_z,
+                a_pump_m2=_a_pump,
+                sigma_p=_sigma_p,
+                gamma_p=_gamma_p,
+                hnu_p=_hnu_p,
+                sigma_ep=_sigma_ep,
+                sigma_a_sig=_sigma_a_s,
+                sigma_e_sig=_sigma_e_s,
+                gamma_s=_gamma_s_warm,
+                a_signal_m2=_a_sig_warm,
+                hnu_s=_hnu_s,
+                packet_energy_j=inp.packet_energy_j,
+                rep_rate_hz=inp.rep_rate_hz,
+                tau_21_s=_tau21,
+                n_tot=n_yb,
+                initial_n2_fraction=float(np.mean(warm.n2_pre_packet) / n_yb),
+                progress_callback=progress_callback,
+                progress_base=0.22,
+                progress_span=0.10,
+            )
+            initial_n2_fraction_z = (warm.n2_pre_packet / n_yb).astype(np.float64)
+            warmup_result = warm
+            warmup_iter = warm.n_iter
+            warmup_residual = warm.residual
+            warmup_converged = warm.converged
+            warmup_notes = warm.notes
 
         cfg = FiberCPAConfig(
             material=material,
@@ -209,6 +386,8 @@ def run_simulation(
             signal=sig_spec,
             pump=pump_spec,
             include_ase=inp.include_ase,
+            initial_n2_fraction=initial_n2_fraction,
+            initial_n2_fraction_z=initial_n2_fraction_z,
         )
 
         t0 = time.perf_counter()
@@ -281,7 +460,8 @@ def run_simulation(
         from laser_sim.pulses.chirp import chirp_sigma_t_s
 
         sigma_t = chirp_sigma_t_s(sig_spec)
-        p_peak_in = float(sig_spec.energy_per_pulse_j / (np.sqrt(2.0 * np.pi) * sigma_t))
+        e_per_pulse_flat = sig_spec.packet_energy_j / max(sig_spec.burst_count, 1)
+        p_peak_in = float(e_per_pulse_flat / (np.sqrt(2.0 * np.pi) * sigma_t))
         gain_ratio = result.energy_packet_out_j / max(result.energy_packet_in_j, 1e-30)
         p_peak_out = p_peak_in * gain_ratio
         a_eff = result.a_signal_m2 if result.a_signal_m2 > 0 else (
@@ -370,6 +550,23 @@ def run_simulation(
             backend=inp.backend,
         )
 
+        suggested_flat_weights = None
+        if (
+            result.pulse_energies_in_j is not None
+            and result.pulse_energies_out_j is not None
+            and len(result.pulse_energies_in_j) > 1
+        ):
+            from laser_sim.physics.equalization import estimate_flat_packet_weights
+
+            try:
+                w = estimate_flat_packet_weights(
+                    result.pulse_energies_in_j,
+                    result.pulse_energies_out_j,
+                )
+                suggested_flat_weights = w.tolist()
+            except Exception:
+                suggested_flat_weights = None
+
         return SimRunOutcome(
             ok=True,
             result=result,
@@ -383,6 +580,18 @@ def run_simulation(
             taichi_arch=taichi_arch,
             wall_time_s=wall_s,
             b_integral=b_integral,
+            packet_energy_target_j=inp.packet_energy_j,
+            suggested_flat_weights=suggested_flat_weights,
+            n_t=int(t.size),
+            n_lambda=int(wl.size),
+            time_resolution=inp.time_resolution,
+            steady_state_warmup_used=use_warmup,
+            steady_state_warmup_iter=warmup_iter,
+            steady_state_warmup_residual=warmup_residual,
+            steady_state_warmup_converged=warmup_converged,
+            warmup_result=warmup_result,
+            signal_spec=sig_spec,
+            pump_wavelength_datasheet_nm=inp.pump_wavelength_nm,
         )
     except Exception as exc:
         return SimRunOutcome(
@@ -400,10 +609,16 @@ def format_energy_summary(out: SimRunOutcome) -> str:
     g_pkt = r.energy_packet_out_j / max(r.energy_packet_in_j, 1e-30)
     g_pls = r.energy_pulse_out_j / max(r.energy_pulse_in_j, 1e-30)
     e_exp = r.energy_packet_expected_j
+    target_uj = (
+        out.packet_energy_target_j * 1e6
+        if out.packet_energy_target_j is not None
+        else e_exp * 1e6
+    )
     lines = [
         f"Packet gain (energy): {g_pkt:.4f}",
         f"Single-pulse gain (1/e² window, 1st pulse): {g_pls:.4f}",
-        f"Packet energy expected / in: {e_exp*1e6:.3f} / {r.energy_packet_in_j*1e6:.3f} µJ",
+        f"Packet energy in:  {r.energy_packet_in_j*1e6:.3f} µJ  (target: {target_uj:.3f} µJ)",
+        f"Packet energy expected: {e_exp*1e6:.3f} µJ",
         f"Single-pulse energy in (1/e²): {r.energy_pulse_in_j*1e6:.4f} µJ",
         f"Single-pulse energy out (1/e²): {r.energy_pulse_out_j*1e6:.4f} µJ",
         f"Pump absorbed (energy fraction): {r.pump_power_absorbed_fraction*100:.1f}%",
@@ -417,6 +632,16 @@ def format_energy_summary(out: SimRunOutcome) -> str:
             f"Mode area A_eff: {a_sig * 1e12:.2f} µm²  (MFD {mfd_um:.2f} µm)"
         )
     lines.append(f"ASE out (µJ): {r.energy_ase_out_j*1e6:.4f}")
+    if r.ase_fraction_of_emission > 0 or r.energy_ase_out_j > 0:
+        lines.append(
+            f"ASE fraction of emission: {r.ase_fraction_of_emission*100:.2f}%  "
+            f"(unguided spont {r.energy_unguided_spont_j*1e6:.4f} µJ)"
+        )
+    bal = "OK" if r.energy_balance_ok else "OVER PUMP"
+    lines.append(
+        f"Energy budget ({bal}): pump abs {max(r.energy_pump_in_j - r.energy_pump_out_j, 0)*1e3:.4f} mJ, "
+        f"emit {((r.energy_packet_out_j - r.energy_packet_in_j) + r.energy_ase_out_j + r.energy_unguided_spont_j)*1e3:.4f} mJ"
+    )
     if out.b_integral is not None:
         b = out.b_integral
         lines.append(
@@ -435,6 +660,43 @@ def format_energy_summary(out: SimRunOutcome) -> str:
         lines.append(
             f"Rep rate: {r.rep_rate_hz/1e3:.2f} kHz, periods={r.n_periods_simulated}, "
             f"steady-state={'yes' if r.steady_state_reached else 'no'} (metric={r.steady_state_metric:.4f})"
+        )
+    if out.steady_state_warmup_used:
+        conv = "converged" if out.steady_state_warmup_converged else "did NOT converge"
+        lines.append(
+            f"Steady-state warmup: {conv} in {out.steady_state_warmup_iter} iter "
+            f"(residual={out.steady_state_warmup_residual:.2e}); 1 period time-resolved"
+        )
+        w = out.warmup_result
+        if w is not None and w.e_out_per_iter_j.size:
+            e0 = float(w.e_out_per_iter_j[0]) * 1e6
+            ef = float(w.e_out_per_iter_j[-1]) * 1e6
+            g0 = float(w.gain_per_iter[0])
+            gf = float(w.gain_per_iter[-1])
+            lines.append(
+                f"Warmup packet energy (lumped): {e0:.4f} → {ef:.4f} µJ  "
+                f"(gain {g0:.3f} → {gf:.3f})"
+            )
+    if out.n_t is not None:
+        lines.append(
+            f"Grid: n_t={out.n_t}, n_lambda={out.n_lambda}, "
+            f"time resolution={out.time_resolution or 'standard'}"
+        )
+    if out.result is not None and out.pump_wavelength_datasheet_nm is not None:
+        ds = out.pump_wavelength_datasheet_nm
+        sim = out.result.pump_wavelength_nm
+        if abs(ds - sim) > 0.5:
+            lines.append(
+                f"Pump λ: simulation {sim:.2f} nm, datasheet (N calc) {ds:.2f} nm"
+            )
+        else:
+            lines.append(f"Pump λ: {sim:.2f} nm")
+    if out.suggested_flat_weights is not None:
+        w = out.suggested_flat_weights
+        w_str = ", ".join(f"{x:.3f}" for x in w)
+        lines.append(f"Suggested flat-packet weights: [{w_str}]")
+        lines.append(
+            f"  (peak/mean ratio: {max(w)/min(w):.2f}x; copy to pulse weights for next run)"
         )
     return "\n".join(lines)
 

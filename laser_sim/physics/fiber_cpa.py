@@ -72,6 +72,8 @@ class FiberCPAConfig:
     backward_pump: bool = False
     backward_pump_fraction: float = 0.0
     include_ase: bool = True
+    initial_n2_fraction: float = 0.0
+    initial_n2_fraction_z: np.ndarray | None = None
     four_level: FourLevelLifetimes | None = None
     use_group_velocity_walkoff: bool = False
     use_nonlinear: bool = False
@@ -107,6 +109,10 @@ class FiberCPAResult:
     energy_ase_out_j: float
     pump_power_absorbed_fraction: float
     notes: str
+    energy_unguided_spont_j: float = 0.0
+    energy_balance_ok: bool = True
+    energy_balance_residual_j: float = 0.0
+    ase_fraction_of_emission: float = 0.0
     steady_state_reached: bool = False
     steady_state_metric: float = float("nan")
     rep_rate_hz: float | None = None
@@ -118,6 +124,8 @@ class FiberCPAResult:
     v_number: float = 0.0
     signal_mode_area_m2: float = 0.0
     a_signal_m2: float = 0.0
+    pulse_energies_in_j: np.ndarray | None = None
+    pulse_energies_out_j: np.ndarray | None = None
     g0_small_signal_np_m: np.ndarray | None = None
     g0_small_signal_db_m: np.ndarray | None = None
     lp_modes: list | None = None
@@ -172,9 +180,20 @@ def _pump_pass(
     progress_callback: ProgressCallback | None = None,
     progress_base: float = 0.05,
     progress_span: float = 0.30,
+    initial_n2_fraction: float = 0.0,
+    initial_n2_fraction_z: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Build N₀,N₂,N₃(z,t) from pump rates; advance P_p with α_p = σ_p N₀."""
     nz, nt = z.size, t.size
+    init_z = (
+        np.asarray(initial_n2_fraction_z, dtype=np.float64)
+        if initial_n2_fraction_z is not None
+        else None
+    )
+    if init_z is not None and init_z.size != nz:
+        raise ValueError(
+            f"initial_n2_fraction_z has size {init_z.size}, expected {nz}"
+        )
     p_p_fwd = np.zeros((nz, nt))
     p_p_bwd = np.zeros((nz, nt))
     n0 = np.zeros((nz, nt))
@@ -191,6 +210,7 @@ def _pump_pass(
         if iz == 0 or iz == nz - 1 or iz % max(1, nz // 20) == 0:
             frac = progress_base + progress_span * (iz + 1) / max(nz, 1)
             emit_progress(progress_callback, frac, f"Pump pass: z slice {iz + 1}/{nz}")
+        f2_iz = float(init_z[iz]) if init_z is not None else float(initial_n2_fraction)
         n0[iz], n1[iz], n2[iz], n3[iz] = march_populations_pump_qss(
             t,
             p_p_fwd[iz],
@@ -202,15 +222,28 @@ def _pump_pass(
             sigma_ep=sigma_ep,
             hnu_p=hnu_p,
             lifetimes=lifetimes,
+            initial_n2_fraction=f2_iz,
         )
         if iz >= nz - 1:
             continue
         p_p_fwd[iz + 1] = advance_pump_power_z(
-            p_p_fwd[iz], n0[iz], sigma_p, dz, gamma_p=gamma_p
+            p_p_fwd[iz],
+            n0[iz],
+            sigma_p,
+            dz,
+            gamma_p=gamma_p,
+            n2=n2[iz],
+            sigma_ep=sigma_ep,
         )
         if backward_pump and backward_fraction > 0:
             p_p_bwd[iz] = advance_pump_power_z(
-                p_p_bwd[iz + 1], n0[iz], sigma_p, dz, gamma_p=gamma_p
+                p_p_bwd[iz + 1],
+                n0[iz],
+                sigma_p,
+                dz,
+                gamma_p=gamma_p,
+                n2=n2[iz],
+                sigma_ep=sigma_ep,
             )
 
     return p_p_fwd, p_p_bwd, n0, n1, n2, n3
@@ -224,6 +257,148 @@ def _time_step_deltas(t: np.ndarray) -> np.ndarray:
         dt[1:] = diff
         dt[0] = diff[0]
     return dt
+
+
+# Coupled ASE iterations per z-slab (spontaneous + stimulated deplete N₂).
+N_ASE_COUPLED_ITERS = 1
+
+
+def _local_spontaneous_source_w_nm(
+    n2: np.ndarray,
+    sigma_e: np.ndarray,
+    hnu: np.ndarray,
+    wl: np.ndarray,
+    *,
+    tau_21_s: float,
+    eta_guided: float,
+    gamma_s: float,
+    n_tot: float,
+) -> np.ndarray:
+    """Spontaneous ASE source (nt, nlam) W/nm; zero where N₂ is negligible."""
+    nt = n2.size
+    nlam = sigma_e.size
+    out = np.zeros((nt, nlam), dtype=np.float64)
+    floor = 1e-12 * n_tot
+    for it in range(nt):
+        n2i = float(n2[it])
+        if n2i > floor:
+            out[it] = spontaneous_power_w_per_nm(
+                n2i,
+                sigma_e,
+                hnu,
+                wl,
+                tau_21_s=tau_21_s,
+                eta_guided=eta_guided,
+                gamma_s=gamma_s,
+            )
+    return out
+
+
+def _propagate_ase_z_slab(
+    iz: int,
+    *,
+    n0: np.ndarray,
+    n2: np.ndarray,
+    n_tot: float,
+    dz: float,
+    a_signal: float,
+    gamma_s: float,
+    sigma_a: np.ndarray,
+    sigma_e: np.ndarray,
+    hnu: np.ndarray,
+    wl: np.ndarray,
+    tau_21_s: float,
+    eta_guided: float,
+    p_ase_f: np.ndarray,
+    p_ase_b: np.ndarray,
+) -> None:
+    """Forward/backward ASE slab with local N₂(t) spontaneous source and g(N₀,N₂)."""
+    gain_ase = gain_coefficient_m(n0[iz], n2[iz], sigma_a, sigma_e, gamma_s=gamma_s)
+    gdz = np.clip(gain_ase * dz, -50.0, 50.0)
+    spont = _local_spontaneous_source_w_nm(
+        n2[iz],
+        sigma_e,
+        hnu,
+        wl,
+        tau_21_s=tau_21_s,
+        eta_guided=eta_guided,
+        gamma_s=gamma_s,
+        n_tot=n_tot,
+    )
+    src = spont * a_signal * dz
+    p_ase_f[iz + 1] = np.maximum(p_ase_f[iz] * np.exp(gdz) + src, 0.0)
+    p_ase_b[iz] = np.maximum(p_ase_b[iz + 1] * np.exp(-gdz) + src, 0.0)
+
+
+def _deplete_populations_from_ase_slab(
+    iz: int,
+    *,
+    n0: np.ndarray,
+    n1: np.ndarray,
+    n2: np.ndarray,
+    n3: np.ndarray,
+    n_tot: float,
+    dt_slab: float,
+    dlam: np.ndarray,
+    sigma_e: np.ndarray,
+    sigma_a: np.ndarray,
+    hnu: np.ndarray,
+    gamma_p: float,
+    gamma_s: float,
+    sigma_p: float,
+    sigma_ep: float,
+    hnu_p: float,
+    a_signal: float,
+    a_pump: float,
+    lifetimes: FourLevelLifetimes,
+    p_p_fwd: np.ndarray,
+    p_p_bwd: np.ndarray,
+    p_ase_f: np.ndarray,
+    p_ase_b: np.ndarray,
+    ase_threshold_w: float = 1e-6,
+) -> None:
+    """RK4 over slab transit: ASE stimulated emission depletes N₂ (active bins only)."""
+    if dt_slab <= 0.0:
+        return
+    nt = n0.shape[1]
+    nlam = dlam.size
+    zero_sig = np.zeros(nlam, dtype=np.float64)
+    n2_floor = 1e-12 * n_tot
+    p_ase_mid = 0.25 * (
+        p_ase_f[iz] + p_ase_f[iz + 1] + p_ase_b[iz] + p_ase_b[iz + 1]
+    )
+    p_t = np.sum(p_ase_mid * dlam, axis=1)
+    active = np.where((n2[iz] > n2_floor) & (p_t >= ase_threshold_w))[0]
+    for it in active:
+        p_ase_row = p_ase_mid[it]
+        ip = float(p_p_fwd[iz, it] + p_p_bwd[iz, it]) / a_pump
+        n0i, n2i, n3i = march_level_interval(
+            float(n0[iz, it]),
+            float(n2[iz, it]),
+            float(n3[iz, it]),
+            n_tot,
+            dt_slab,
+            ip_w_m2=ip,
+            p_sig_row=zero_sig,
+            p_ase_row=p_ase_row,
+            dlam=dlam,
+            sigma_e=sigma_e,
+            sigma_a=sigma_a,
+            hnu=hnu,
+            gamma_p=gamma_p,
+            gamma_s=gamma_s,
+            sigma_p=sigma_p,
+            sigma_ep=sigma_ep,
+            hnu_p=hnu_p,
+            a_signal=a_signal,
+            lifetimes=lifetimes,
+            include_signal=False,
+            couple_ase=True,
+        )
+        n0[iz, it] = n0i
+        n2[iz, it] = n2i
+        n3[iz, it] = n3i
+        n1[iz, it] = 0.0
 
 
 def _signal_pass(
@@ -254,6 +429,7 @@ def _signal_pass(
     eta_guided: float,
     lifetimes: FourLevelLifetimes,
     include_ase: bool,
+    burst_start_time_s: float = 0.0,
     progress_callback: ProgressCallback | None = None,
     progress_base: float = 0.38,
     progress_span: float = 0.54,
@@ -263,10 +439,17 @@ def _signal_pass(
     p_ase_f = np.zeros((nz, nt, nlam))
     p_ase_b = np.zeros((nz, nt, nlam))
     p_s[0] = p_s_in
+    # Pump-pass populations (per z,t); restored whenever signal/ASE coupling is off.
+    n0_pump = n0.copy()
+    n2_pump = n2.copy()
+    n3_pump = n3.copy()
 
     dlam = np.gradient(wl)
     sig_threshold_w = 0.05
+    ase_threshold_w = 1e-6
     dt_arr = _time_step_deltas(t)
+    n_iters = N_ASE_COUPLED_ITERS if include_ase else 1
+    it_first_active = int(np.clip(np.searchsorted(t, float(burst_start_time_s), side="left"), 0, nt - 1))
 
     for iz in range(nz - 1):
         if iz == 0 or iz == nz - 2 or iz % max(1, (nz - 1) // 20) == 0:
@@ -277,35 +460,110 @@ def _signal_pass(
                 f"Signal pass: z slice {iz + 1}/{nz - 1}",
             )
 
-        n0_run = float(n0[iz, 0])
-        n2_run = float(n2[iz, 0])
-        n3_run = float(n3[iz, 0])
+        for _ase_pass in range(n_iters):
+            n0_run = float(n0_pump[iz, it_first_active])
+            n2_run = float(n2_pump[iz, it_first_active])
+            n3_run = float(n3_pump[iz, it_first_active])
+            in_coupled_interval = False
 
-        for it in range(nt):
-            n0[iz, it] = n0_run
-            n2[iz, it] = n2_run
-            n3[iz, it] = n3_run
-            n1[iz, it] = 0.0
+            for it in range(nt):
+                if it < it_first_active:
+                    n0i = float(n0_pump[iz, it])
+                    n2i = float(n2_pump[iz, it])
+                    n3i = float(n3_pump[iz, it])
+                elif not in_coupled_interval:
+                    n0i = float(n0_pump[iz, it])
+                    n2i = float(n2_pump[iz, it])
+                    n3i = float(n3_pump[iz, it])
+                else:
+                    n0i, n2i, n3i = n0_run, n2_run, n3_run
 
-            gain_it = gamma_s * (sigma_e * n2_run - sigma_a * n0_run)
-            gdz_it = np.clip(gain_it * dz, -50.0, 50.0)
-            p_in = p_s[iz, it]
-            p_out = np.maximum(p_in * np.exp(gdz_it), 0.0)
-            p_s[iz + 1, it] = p_out
+                gain_it = gamma_s * (sigma_e * n2i - sigma_a * n0i)
+                gdz_it = np.clip(gain_it * dz, -50.0, 50.0)
+                p_in = p_s[iz, it]
+                p_out = np.maximum(p_in * np.exp(gdz_it), 0.0)
+                p_s[iz + 1, it] = p_out
 
-            dt_it = float(dt_arr[it + 1]) if it + 1 < nt else 0.0
-            if dt_it > 0.0:
-                ip = float(p_p_fwd[iz, it] + p_p_bwd[iz, it]) / a_pump
-                sig_w = float(np.sum(0.5 * (p_in + p_out) * dlam))
-                p_row = 0.5 * (p_in + p_out) if sig_w >= sig_threshold_w else np.zeros(nlam)
-                n0i, n2i, n3i = march_level_interval(
-                    n0_run,
-                    n2_run,
-                    n3_run,
-                    n_tot,
-                    dt_it,
-                    ip_w_m2=ip,
-                    p_sig_row=p_row,
+                dt_it = float(dt_arr[it + 1]) if it + 1 < nt else 0.0
+                couple_sig = False
+                couple_ase = False
+                if it >= it_first_active and dt_it > 0.0:
+                    p_ase_row = p_ase_f[iz, it] + p_ase_b[iz, it] if include_ase else np.zeros(nlam)
+                    sig_w = float(np.sum(0.5 * (p_in + p_out) * dlam))
+                    ase_w = float(np.sum(p_ase_row * dlam)) if include_ase else 0.0
+                    couple_sig = sig_w >= sig_threshold_w
+                    couple_ase = include_ase and ase_w >= ase_threshold_w
+
+                    if couple_sig or couple_ase:
+                        if not in_coupled_interval:
+                            n0_run = float(n0_pump[iz, it])
+                            n2_run = float(n2_pump[iz, it])
+                            n3_run = float(n3_pump[iz, it])
+                            in_coupled_interval = True
+                        ip = float(p_p_fwd[iz, it] + p_p_bwd[iz, it]) / a_pump
+                        p_row = 0.5 * (p_in + p_out) if couple_sig else np.zeros(nlam)
+                        n0_run, n2_run, n3_run = march_level_interval(
+                            n0_run,
+                            n2_run,
+                            n3_run,
+                            n_tot,
+                            dt_it,
+                            ip_w_m2=ip,
+                            p_sig_row=p_row,
+                            p_ase_row=p_ase_row,
+                            dlam=dlam,
+                            sigma_e=sigma_e,
+                            sigma_a=sigma_a,
+                            hnu=hnu,
+                            gamma_p=gamma_p,
+                            gamma_s=gamma_s,
+                            sigma_p=sigma_p,
+                            sigma_ep=sigma_ep,
+                            hnu_p=hnu_p,
+                            a_signal=a_signal,
+                            lifetimes=lifetimes,
+                            include_signal=couple_sig,
+                            couple_ase=couple_ase,
+                        )
+                        n0i, n2i, n3i = n0_run, n2_run, n3_run
+                    else:
+                        in_coupled_interval = False
+                        n0i = float(n0_pump[iz, it])
+                        n2i = float(n2_pump[iz, it])
+                        n3i = float(n3_pump[iz, it])
+
+                if it >= it_first_active:
+                    n0[iz, it] = n0i
+                    n2[iz, it] = n2i
+                    n3[iz, it] = n3i
+                    n1[iz, it] = 0.0
+
+            if include_ase:
+                _propagate_ase_z_slab(
+                    iz,
+                    n0=n0,
+                    n2=n2,
+                    n_tot=n_tot,
+                    dz=dz,
+                    a_signal=a_signal,
+                    gamma_s=gamma_s,
+                    sigma_a=sigma_a,
+                    sigma_e=sigma_e,
+                    hnu=hnu,
+                    wl=wl,
+                    tau_21_s=lifetimes.tau_21_s,
+                    eta_guided=eta_guided,
+                    p_ase_f=p_ase_f,
+                    p_ase_b=p_ase_b,
+                )
+                _deplete_populations_from_ase_slab(
+                    iz,
+                    n0=n0,
+                    n1=n1,
+                    n2=n2,
+                    n3=n3,
+                    n_tot=n_tot,
+                    dt_slab=dt_travel,
                     dlam=dlam,
                     sigma_e=sigma_e,
                     sigma_a=sigma_a,
@@ -316,39 +574,13 @@ def _signal_pass(
                     sigma_ep=sigma_ep,
                     hnu_p=hnu_p,
                     a_signal=a_signal,
+                    a_pump=a_pump,
                     lifetimes=lifetimes,
-                    include_signal=sig_w >= sig_threshold_w,
+                    p_p_fwd=p_p_fwd,
+                    p_p_bwd=p_p_bwd,
+                    p_ase_f=p_ase_f,
+                    p_ase_b=p_ase_b,
                 )
-                n0_run, n2_run, n3_run = n0i, n2i, n3i
-
-        # Keep pump-pass populations at iz+1 (do not copy depleted slice from iz).
-
-        if include_ase:
-            gain_ase = gain_coefficient_m(
-                n0[iz], n2[iz], sigma_a, sigma_e, gamma_s=gamma_s
-            )
-            gdz_ase = np.clip(gain_ase * dz, -50.0, 50.0)
-            spont_row = np.zeros(nlam)
-            for it in range(nt):
-                sp = spontaneous_power_w_per_nm(
-                    float(n2[iz, it]),
-                    sigma_e,
-                    hnu,
-                    wl,
-                    tau_21_s=lifetimes.tau_21_s,
-                    eta_guided=eta_guided,
-                    gamma_s=gamma_s,
-                )
-                spont_row += sp
-            spont_row /= max(nt, 1)
-            p_ase_f[iz + 1] = np.maximum(
-                p_ase_f[iz] * np.exp(gdz_ase) + spont_row * a_signal * dz,
-                0.0,
-            )
-            p_ase_b[iz] = np.maximum(
-                p_ase_b[iz + 1] * np.exp(-gdz_ase) + spont_row * a_signal * dz,
-                0.0,
-            )
 
     return p_s, p_ase_f, p_ase_b, n0, n1, n2, n3
 
@@ -422,17 +654,27 @@ def run_fiber_cpa(
 
     p_p_in = build_pump_power(t, cfg.pump)
 
+    from laser_sim.physics.four_level import pump_rate_per_ion, steady_state_n2_fraction_pump
+
     peak_pump_w = float(np.max(p_p_in)) if p_p_in.size else cfg.pump.peak_power_w
     i_p_peak = peak_pump_w / a_pump
-    w_p_abs_peak = gamma_p * sigma_p * i_p_peak / hnu_p
-    saturation_param = w_p_abs_peak * lifetimes.tau_21_s
-    if saturation_param < 0.1:
+    w_p_abs_peak, w_p_esa_peak = pump_rate_per_ion(
+        i_p_peak, sigma_p=sigma_p, sigma_ep=sigma_ep, hnu_p=hnu_p
+    )
+    n2_ss_peak = steady_state_n2_fraction_pump(
+        w_p_abs_peak, w_p_esa_peak, lifetimes.tau_21_s
+    )
+    sig_idx = int(np.argmin(np.abs(wl - cfg.signal.center_wavelength_nm)))
+    beta_t = float(
+        sigma_a[sig_idx] / (sigma_a[sig_idx] + sigma_e[sig_idx] + 1e-30)
+    )
+    if n2_ss_peak < beta_t:
+        p_sat = hnu_p * a_pump / (sigma_p * lifetimes.tau_21_s)
         warnings.warn(
-            f"Pump saturation parameter W_p·τ₂₁ = {saturation_param:.4f} << 1. "
-            f"Peak inversion will be ≈{saturation_param/(1+saturation_param)*100:.2f}% "
-            f"— fiber is below transparency. "
-            f"For useful gain increase pump power (~{0.5/max(saturation_param,1e-9)/lifetimes.tau_21_s*a_pump/gamma_p/sigma_p*hnu_p:.1f} W "
-            f"needed for 50% inversion) or reduce cladding area.",
+            f"Pump-only steady-state N₂/N_tot ≈ {n2_ss_peak*100:.1f}% at peak pump "
+            f"({peak_pump_w:.2g} W), below signal transparency β_t ≈ {beta_t*100:.2f}% "
+            f"at {cfg.signal.center_wavelength_nm:.0f} nm. "
+            f"Cladding P_sat ≈ {p_sat:.2f} W; increase pump or use core pumping.",
             stacklevel=2,
         )
 
@@ -454,6 +696,8 @@ def run_fiber_cpa(
         backward_pump=cfg.backward_pump,
         backward_fraction=cfg.backward_pump_fraction,
         progress_callback=progress_callback,
+        initial_n2_fraction=cfg.initial_n2_fraction,
+        initial_n2_fraction_z=cfg.initial_n2_fraction_z,
     )
 
     pops_after_pump = populations_to_fractions(
@@ -489,6 +733,7 @@ def run_fiber_cpa(
         eta_guided=eta_guided,
         lifetimes=lifetimes,
         include_ase=cfg.include_ase,
+        burst_start_time_s=cfg.signal.burst_start_time_s,
         progress_callback=progress_callback,
     )
 
@@ -522,12 +767,51 @@ def run_fiber_cpa(
     e_pkt_out = integrate_packet_energy(p_s[-1], t, wl, cfg.signal)
     e_pls_in = integrate_single_pulse_energy(p_s[0], t, wl, cfg.signal, pulse_index=0)
     e_pls_out = integrate_single_pulse_energy(p_s[-1], t, wl, cfg.signal, pulse_index=0)
+    n_burst = int(cfg.signal.burst_count)
+    pulse_e_in = np.array(
+        [
+            integrate_single_pulse_energy(p_s[0], t, wl, cfg.signal, pulse_index=b)
+            for b in range(n_burst)
+        ]
+    )
+    pulse_e_out = np.array(
+        [
+            integrate_single_pulse_energy(p_s[-1], t, wl, cfg.signal, pulse_index=b)
+            for b in range(n_burst)
+        ]
+    )
     e_ase = (
         integrate_packet_energy(p_ase_f[-1] + p_ase_b[0], t, wl, cfg.signal)
         if cfg.include_ase
         else 0.0
     )
     e_pump_abs_frac = 1.0 - e_pump_out / max(e_pump_in, 1e-30)
+
+    from laser_sim.physics.energy_budget import compute_amplifier_energy_budget
+
+    budget = compute_amplifier_energy_budget(
+        t_s=t,
+        z_m=z,
+        populations=pops,
+        wavelength_nm=wl,
+        n_tot=n_tot,
+        tau_21_s=lifetimes.tau_21_s,
+        a_signal_m2=a_signal,
+        eta_guided=eta_guided,
+        gamma_s=gamma_s,
+        energy_pump_in_j=e_pump_in,
+        energy_pump_out_j=e_pump_out,
+        energy_packet_in_j=e_pkt_in,
+        energy_packet_out_j=e_pkt_out,
+        energy_ase_out_j=e_ase,
+    )
+    if not budget.balance_ok:
+        warnings.warn(
+            f"Energy budget: emission ({budget.total_emission_j*1e3:.4f} mJ) exceeds "
+            f"pump absorbed ({budget.pump_absorbed_j*1e3:.4f} mJ) by "
+            f"{budget.balance_residual_j*1e3:.4f} mJ. Check saturation or grid resolution.",
+            stacklevel=2,
+        )
 
     notes = (
         f"N_tot={n_tot:.3e} m⁻³  N₂_max/N_tot={float(n2.max())/n_tot:.4f}. "
@@ -570,8 +854,17 @@ def run_fiber_cpa(
         energy_packet_out_j=e_pkt_out,
         energy_packet_expected_j=e_pkt_expected,
         energy_ase_out_j=e_ase,
+        energy_unguided_spont_j=budget.spontaneous_unguided_j,
+        energy_balance_ok=budget.balance_ok,
+        energy_balance_residual_j=budget.balance_residual_j,
+        ase_fraction_of_emission=budget.ase_fraction_of_emission,
         pump_power_absorbed_fraction=e_pump_abs_frac,
-        notes=notes,
+        notes=notes + (
+            f" Energy budget: emit={budget.total_emission_j*1e3:.3f} mJ, "
+            f"pump abs={budget.pump_absorbed_j*1e3:.3f} mJ, "
+            f"ASE frac={budget.ase_fraction_of_emission*100:.1f}%, "
+            f"unguided spont={budget.spontaneous_unguided_j*1e6:.3f} µJ."
+        ),
         steady_state_reached=ss_ok,
         steady_state_metric=ss_metric,
         rep_rate_hz=cfg.signal.rep_rate_hz if cfg.signal.rep_rate_mode else None,
@@ -583,6 +876,8 @@ def run_fiber_cpa(
         v_number=v_no,
         signal_mode_area_m2=a_signal,
         a_signal_m2=a_signal,
+        pulse_energies_in_j=pulse_e_in,
+        pulse_energies_out_j=pulse_e_out,
         g0_small_signal_np_m=g0_np,
         g0_small_signal_db_m=g0_db,
     )

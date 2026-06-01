@@ -40,6 +40,42 @@ class Material:
         lam = np.atleast_1d(wavelength_nm) * NM_TO_M
         return H * C0 / lam
 
+    @property
+    def wavelength_range_nm(self) -> tuple[float, float]:
+        wl = self.wavelength_nm
+        return float(wl[0]), float(wl[-1])
+
+
+def require_pump_cross_sections(
+    material: Material,
+    pump_wavelength_nm: float,
+    *,
+    min_sigma_abs_m2: float = 1e-27,
+) -> tuple[float, float]:
+    """
+    Require tabulated pump cross-sections at ``pump_wavelength_nm`` (no extrapolation).
+
+    Raises ``ValueError`` if the wavelength is outside the material table or if
+    σ_abs is negligible (no usable pump band).
+    """
+    wl = float(pump_wavelength_nm)
+    lo, hi = material.wavelength_range_nm
+    if wl < lo or wl > hi:
+        raise ValueError(
+            f"Simulation pump wavelength {wl:.2f} nm is outside the cross-section "
+            f"table for {material.name} ({lo:.1f}–{hi:.1f} nm). "
+            f"Pick a wavelength within the glass data range or choose another material."
+        )
+    sigma_abs = float(material.sigma_abs_at(wl)[0])
+    sigma_em = float(material.sigma_em_at(wl)[0])
+    if sigma_abs < min_sigma_abs_m2:
+        raise ValueError(
+            f"No usable pump absorption at {wl:.2f} nm in {material.name}: "
+            f"σ_abs = {sigma_abs:.3e} m² (tabulated range {lo:.1f}–{hi:.1f} nm). "
+            f"Try a wavelength on the Yb pump band (e.g. 915–980 nm for Yb:glass)."
+        )
+    return sigma_abs, sigma_em
+
 
 def load_material(key: str) -> Material:
     from laser_sim.materials import yb_glass, yb_yag, yb_ylf

@@ -19,7 +19,7 @@ if str(ROOT) not in sys.path:
 import dearpygui.dearpygui as dpg
 
 from laser_sim.calculators.dopant import estimate_dopant_concentration
-from laser_sim.gui.runner import SimInputs, format_energy_summary, run_simulation
+from laser_sim.gui.runner import SimInputs, SimRunOutcome, format_energy_summary, run_simulation
 from laser_sim.materials import load_material
 from laser_sim.pulses.chirp import ChirpedBurstSpec
 from laser_sim.viz.plot_limits import (
@@ -27,6 +27,7 @@ from laser_sim.viz.plot_limits import (
     integrated_power_vs_time,
     packet_center_time_s,
     pump_plot_limits,
+    resolve_plot_spec_from_signal,
     sample_temporal_traces,
     spectrum_plot_limits,
 )
@@ -37,6 +38,8 @@ _SIG_IN_SERIES = "sig_in_series"
 _SIG_OUT_SERIES = "sig_out_series"
 _SPEC_IN_SERIES = "spec_in_series"
 _SPEC_OUT_SERIES = "spec_out_series"
+
+_last_outcome: dict[str, SimRunOutcome | None] = {"value": None}
 
 
 def _log(msg: str, clear: bool = False) -> None:
@@ -69,6 +72,14 @@ def _read_inputs() -> SimInputs:
     manual_n = dpg.get_value("manual_n_check")
     n_manual = dpg.get_value("n_manual") if manual_n else None
 
+    pulse_weights: list[float] | None = None
+    pw_text = (dpg.get_value("pulse_weights_text") or "").strip()
+    if pw_text:
+        try:
+            pulse_weights = [float(x.strip()) for x in pw_text.split(",") if x.strip()]
+        except ValueError:
+            pulse_weights = None
+
     return SimInputs(
         material_key=mat_key,
         core_diameter_um=dpg.get_value("core_um"),
@@ -80,6 +91,11 @@ def _read_inputs() -> SimInputs:
         pump_absorption_db_per_m=dpg.get_value("pump_db_per_m"),
         total_absorption_db=dpg.get_value("pump_total_db"),
         pump_wavelength_nm=dpg.get_value("pump_wl"),
+        simulation_pump_wavelength_nm=(
+            None
+            if dpg.get_value("sim_pump_match_check")
+            else float(dpg.get_value("sim_pump_wl"))
+        ),
         yb_concentration_override_m3=n_manual,
         pump_peak_power_w=dpg.get_value("pump_power_w"),
         pump_cw=pump_cw,
@@ -89,16 +105,23 @@ def _read_inputs() -> SimInputs:
         signal_center_nm=dpg.get_value("sig_center_nm"),
         signal_bandwidth_nm=dpg.get_value("sig_bw_nm"),
         chirp_duration_s=dpg.get_value("chirp_ns") * 1e-9,
-        energy_per_pulse_j=dpg.get_value("pulse_energy_uj") * 1e-6,
+        packet_energy_j=dpg.get_value("packet_energy_uj") * 1e-6,
         burst_count=int(dpg.get_value("burst_count")),
         burst_spacing_s=dpg.get_value("burst_spacing_ns") * 1e-9,
-        burst_start_s=dpg.get_value("burst_start_us") * 1e-6,
+        burst_start_s=(
+            (1.0 / (dpg.get_value("rep_rate_khz") * 1e3))
+            if dpg.get_value("rep_rate_check") and pump_cw
+            else dpg.get_value("burst_start_us") * 1e-6
+        ),
         n_z=int(dpg.get_value("n_z")),
         include_ase=dpg.get_value("ase_check"),
         rep_rate_mode=dpg.get_value("rep_rate_check") and pump_cw,
         rep_rate_hz=dpg.get_value("rep_rate_khz") * 1e3,
         n_periods=int(dpg.get_value("n_periods")),
         steady_state_tol=dpg.get_value("steady_tol"),
+        pulse_relative_powers=pulse_weights,
+        time_resolution=dpg.get_value("time_resolution") or "standard",
+        steady_state_warmup=bool(dpg.get_value("steady_warmup_check")),
     )
 
 
@@ -158,6 +181,30 @@ def _on_pump_mode_change() -> None:
     dpg.configure_item("pulsed_pump_group", show=not cw)
     dpg.configure_item("cw_window_group", show=cw)
     dpg.configure_item("rep_rate_check", enabled=cw)
+    _on_rep_rate_ui_change()
+
+
+def _on_rep_rate_ui_change() -> None:
+    cw = dpg.get_value("pump_mode_combo") == "CW (steady)"
+    rep = dpg.get_value("rep_rate_check") and cw
+    dpg.configure_item("burst_start_us", show=not rep)
+    dpg.configure_item("burst_auto_text", show=rep)
+    if rep:
+        t_rep_ms = 1000.0 / max(dpg.get_value("rep_rate_khz"), 1e-6)
+        dpg.set_value(
+            "burst_auto_text",
+            f"Burst delay: auto (1 rep period = {t_rep_ms:.4f} ms) — CW warm-start",
+        )
+
+
+def _on_apply_flat_weights() -> None:
+    out = _last_outcome.get("value")
+    if out is None or out.suggested_flat_weights is None:
+        _log("No flat-packet weights available — run a simulation first.\n")
+        return
+    w_str = ", ".join(f"{x:.4f}" for x in out.suggested_flat_weights)
+    dpg.set_value("pulse_weights_text", w_str)
+    _log(f"Applied flat-packet weights to next run: [{w_str}]\n")
 
 
 def _update_plots(outcome, plot_spec: ChirpedBurstSpec) -> None:
@@ -167,6 +214,8 @@ def _update_plots(outcome, plot_spec: ChirpedBurstSpec) -> None:
     wl = r.wavelength_nm
     sig_in = r.signal_fwd_w_nm[0]
     sig_out = r.signal_fwd_w_nm[-1]
+    base = outcome.signal_spec if outcome.signal_spec is not None else plot_spec
+    plot_spec = resolve_plot_spec_from_signal(t, sig_in, wl, base)
     p_in_t = integrated_power_vs_time(sig_in, wl)
     p_out_t = integrated_power_vs_time(sig_out, wl)
     from laser_sim.viz.plot_limits import integrate_signal_spectrum
@@ -211,12 +260,16 @@ def _on_run() -> None:
         dpg.set_value("metrics_text", "")
         return
 
-    _update_plots(outcome, _plot_spec_from_inputs(inp))
+    _update_plots(outcome, outcome.signal_spec or _plot_spec_from_inputs(inp))
     summary = format_energy_summary(outcome)
     dpg.set_value("metrics_text", summary)
     dpg.set_value("status_text", "OK")
+    _last_outcome["value"] = outcome
     _log("Simulation finished successfully.\n")
     _log(summary + "\n")
+    if outcome.suggested_flat_weights is not None:
+        w_str = ", ".join(f"{x:.4f}" for x in outcome.suggested_flat_weights)
+        _log(f"Suggested flat-packet weights: [{w_str}]\n")
     if outcome.dopant is not None:
         d = outcome.dopant
         _log(f"Dopant: N={d.concentration_for_rates_m3:.4e} m⁻³\n")
@@ -258,7 +311,12 @@ def _build_ui() -> None:
                 )
                 dpg.add_input_float(label="Pump abs (dB/m)", default_value=6.0, tag="pump_db_per_m", width=150)
                 dpg.add_input_float(label="Total abs (dB)", default_value=12.0, tag="pump_total_db", width=150)
-                dpg.add_input_float(label="Pump λ (nm)", default_value=976.0, tag="pump_wl", width=150)
+                dpg.add_input_float(
+                    label="Pump λ for N calc (nm)",
+                    default_value=976.0,
+                    tag="pump_wl",
+                    width=150,
+                )
                 dpg.add_button(label="Update dopant estimate", callback=_update_dopant_display)
                 dpg.add_text("", tag="dopant_text", wrap=380)
                 dpg.add_checkbox(label="Override N manually", tag="manual_n_check")
@@ -272,6 +330,17 @@ def _build_ui() -> None:
 
                 dpg.add_separator()
                 dpg.add_text("Pump")
+                dpg.add_checkbox(
+                    label="Sim pump λ = datasheet λ",
+                    default_value=True,
+                    tag="sim_pump_match_check",
+                )
+                dpg.add_input_float(
+                    label="Simulation pump λ (nm)",
+                    default_value=976.0,
+                    tag="sim_pump_wl",
+                    width=150,
+                )
                 dpg.add_combo(
                     ["Pulsed", "CW (steady)"],
                     default_value="Pulsed",
@@ -310,7 +379,7 @@ def _build_ui() -> None:
                 dpg.add_input_float(label="Center λ (nm)", default_value=1030.0, tag="sig_center_nm", width=150)
                 dpg.add_input_float(label="Bandwidth (nm)", default_value=8.0, tag="sig_bw_nm", width=150)
                 dpg.add_input_float(label="Chirp (ns)", default_value=0.8, tag="chirp_ns", width=150)
-                dpg.add_input_float(label="Energy/pulse (µJ)", default_value=1.0, tag="pulse_energy_uj", width=150)
+                dpg.add_input_float(label="Packet energy (µJ)", default_value=10.0, tag="packet_energy_uj", width=150)
                 dpg.add_input_int(label="Pulses in packet", default_value=5, tag="burst_count", width=150)
                 dpg.add_input_float(
                     label="Spacing (ns)",
@@ -324,6 +393,13 @@ def _build_ui() -> None:
                     tag="burst_start_us",
                     width=150,
                 )
+                dpg.add_text("", tag="burst_auto_text", show=False, color=(180, 180, 180))
+                dpg.add_input_text(
+                    label="Packet power weights",
+                    default_value="",
+                    tag="pulse_weights_text",
+                    width=250,
+                )
                 dpg.add_input_int(label="z steps", default_value=120, tag="n_z", width=150)
                 dpg.add_checkbox(label="ASE + spontaneous", default_value=True, tag="ase_check")
 
@@ -334,6 +410,7 @@ def _build_ui() -> None:
                     tag="rep_rate_check",
                     default_value=False,
                     enabled=False,
+                    callback=_on_rep_rate_ui_change,
                 )
                 dpg.add_input_float(label="Rep rate (kHz)", default_value=100.0, tag="rep_rate_khz", width=150)
                 dpg.add_input_int(label="Periods", default_value=40, tag="n_periods", width=150)
@@ -345,9 +422,29 @@ def _build_ui() -> None:
                     min_value=0.001,
                     max_value=0.2,
                 )
+                dpg.add_checkbox(
+                    label="Lumped steady-state warmup",
+                    tag="steady_warmup_check",
+                    default_value=True,
+                )
+
+                dpg.add_separator()
+                dpg.add_text("Time resolution")
+                dpg.add_combo(
+                    label="Resolution",
+                    items=["low", "standard", "fine"],
+                    default_value="standard",
+                    tag="time_resolution",
+                    width=150,
+                )
 
                 dpg.add_separator()
                 dpg.add_button(label="Run simulation", callback=_on_run, width=200)
+                dpg.add_button(
+                    label="Apply flat-packet weights to next run",
+                    callback=_on_apply_flat_weights,
+                    width=280,
+                )
                 dpg.add_button(label="Clear log", callback=_on_clear_log, width=200)
                 dpg.add_text("", tag="status_text")
 

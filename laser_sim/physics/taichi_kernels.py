@@ -220,10 +220,17 @@ def _register_kernels() -> None:
         tau_32: float,
         tau_21: float,
     ):
-        n0_i = 1.0
-        n2_i = 0.0
-        n3_i = 0.0
         nt = _cache.p_pump_fwd.shape[1]
+        ip0 = (
+            (_cache.p_pump_fwd[iz, 0] + _cache.p_pump_bwd[iz, 0]) * 0.5 / a_pump
+        )
+        w_p0 = ip0 / hnu_p
+        w_abs0 = w_p0 * sigma_p
+        w_esa0 = w_p0 * sigma_ep
+        n2_i = w_abs0 / (w_abs0 + w_esa0 + 1.0 / tau_21)
+        n3_i = w_abs0 * (1.0 - n2_i) * tau_32 / (1.0 + w_esa0 * tau_32)
+        n2_i = ti.min(n2_i, 1.0 - n3_i)
+        n0_i = ti.max(1.0 - n2_i - n3_i, 0.0)
         _cache.n0[iz, 0] = n0_i
         _cache.n2[iz, 0] = n2_i
         _cache.n3[iz, 0] = n3_i
@@ -239,13 +246,12 @@ def _register_kernels() -> None:
                 * 0.5
                 / a_pump
             )
-            w_p = gamma_p * ip / hnu_p
+            w_p = ip / hnu_p
             w_abs = w_p * sigma_p
             w_esa = w_p * sigma_ep
             n0_i = ti.max(1.0 - n2_i - n3_i, 0.0)
             n3_ss = w_abs * n0_i * tau_32 / (1.0 + w_esa * tau_32)
-            _wt = w_abs * tau_21
-            n2_ss = _wt / (1.0 + _wt)
+            n2_ss = w_abs / (w_abs + w_esa + 1.0 / tau_21)
             n2i = n2_ss - (n2_ss - n2_i) * ti.exp(-dt_i / tau_21)
             n2_i = ti.min(n2i, 1.0 - n3_ss)
             n3_i = n3_ss

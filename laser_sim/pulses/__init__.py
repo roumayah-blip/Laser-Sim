@@ -6,6 +6,7 @@ from laser_sim.pulses.chirp import (
     build_chirped_burst,
     build_chirped_signal,
     build_cpa_time_grid,
+    time_resolution_preset,
     build_pump_power,
     build_rep_rate_time_grid,
     packet_time_extent_s,
@@ -26,4 +27,5 @@ __all__ = [
     "rep_period_s",
     "MIN_BURST_SPACING_S",
     "DEFAULT_BURST_SPACING_S",
+    "time_resolution_preset",
 ]

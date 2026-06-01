@@ -21,7 +21,7 @@ def packet_average_power_w(spec: ChirpedBurstSpec) -> float:
     Rep-rate: E_pulse × rep_rate (duty cycle).
     """
     if spec.rep_rate_mode:
-        return float(spec.energy_per_pulse_j) * float(spec.rep_rate_hz)
+        return float(spec.packet_energy_j) * float(spec.rep_rate_hz)
     e_pkt = packet_energy_expected_j(spec)
     effective_period = max(
         packet_duration_s(spec),

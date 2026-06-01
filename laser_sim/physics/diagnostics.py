@@ -190,8 +190,9 @@ Pump-only QSS (fast N3, march N2 with tau_21):
   N2_ss = (W_p,abs * tau_21) / (1 + W_p,abs * tau_21) * N_tot   [self-consistent; not W*N0*tau]
 
 Signal-pass RK4 (quasi-2L; causal in time at each z):
-  At each z: n_running starts at t[0]; for it=0..n_t-1:
-    g(it) from n_running; P_s[iz+1,it] *= exp(g*dz); RK4 over dt[it]=t[it+1]-t[it] (NOT dt_travel)
+  At each z: n_running starts at burst_start (pump-pass N2 there); march only for it >= burst_start.
+  Pre-burst: pump-pass populations kept; signal gain uses local N0,N2; no RK4 march.
+  For it >= burst_start: g(it) from n_running; P_s[iz+1,it] *= exp(g*dz); RK4 over dt[it] (NOT dt_travel)
   N3 held at 0 in GPU quasi-2L RK4 (no N3/tau_32 term)
 
 Pump depletion along +z (per time slice):
@@ -212,6 +213,19 @@ Power gain over dz (uniform g):
 Dopant from datasheet kappa (dB/m):
   alpha_np = kappa_dB/m / (10/ln 10)
   N_tot = alpha_np / (Gamma_p * sigma_p)   [default; optional legacy N=alpha_np/sigma_p]
+
+Rep-rate CW steady state:
+  CW inversion N2_ss/N_tot = W_p*tau21 / (1 + W_p*tau21)
+  Warm-start: populations initialised at N2_ss (no startup transient)
+  T_rep = 1/f_rep;  burst_start = T_rep (auto)
+  Convergence: compare last two packets; steady_state_tol = user setting
+
+ASE (coupled to populations):
+  Spontaneous: dn2/dt includes -N2/tau21 (all fluorescence depletes inversion)
+  Guided birth: eta*Gamma_s of that decay feeds ASE source at local N2(z,t)
+  Stimulated: W_se from signal AND ASE intensity (incoherent sum) depletes N2
+  After each z-slab: ASE exp(g*dz) + local spont; RK4 over dt_travel with ASE-only W_se
+  Energy: E_emit = E_sig_net + E_ASE_out + E_unguided; require E_emit <= E_pump_abs
 """
 
 
@@ -504,6 +518,7 @@ def _time_dynamics_section(
         "PER-TIME-STEP DYNAMICS AT z=0",
         "=" * 80,
         f"  Populations: {'after pump pass' if result.populations_after_pump is not None else 'after full run'}",
+        f"  Signal march starts at burst_start = {spec.burst_start_time_s * 1e6:.4f} µs (index {int(np.clip(np.searchsorted(t, spec.burst_start_time_s, side='left'), 0, n_t - 1))})",
         f"  N_tot = {n_tot:.6e} m^-3,  Gamma_p = {gamma_p:.6g},  Gamma_s = {gamma_s:.6g}",
         "",
         f"{'t(us)':>10} {'dt(us)':>9} {'P_pump':>10} {'I_p':>11} {'W*tau21':>9} "
@@ -524,8 +539,6 @@ def _time_dynamics_section(
         w_p_series[it] = w_abs
         sat_series[it] = w_abs * tau_21
         n2ss_series[it] = sat_series[it] / (1.0 + sat_series[it])
-        n2 = n2f[it]
-        n2ss_series[it] = max(n2ss_series[it], 1e-30)
         g0_series[it] = float(
             gain_coefficient_m(
                 np.array([n0f[it] * n_tot]),
@@ -544,11 +557,16 @@ def _time_dynamics_section(
         n0 = n0f[it]
         n2 = n2f[it]
         n2ss = n2ss_series[it]
-        approach = (n2ss - n2) / max(n2ss, 1e-12)
+        n2_ss_abs = n2ss * n_tot
+        if n2_ss_abs > 1e-10 * n_tot:
+            approach = (n2ss - n2) / n2ss
+            approach_s = f"{approach:9.4f}"
+        else:
+            approach_s = "      nan"
         p_sig_tot = _integrated_power_w_nm(p_sig[it], dlam)
         lines.append(
             f"{t[it] * 1e6:10.4f} {dt_i * 1e6:9.4f} {p_pump[it]:10.3f} {ip:11.3e} {sat:9.4f} "
-            f"{n0:8.5f} {n2:8.5f} {w_abs:10.3e} {n2ss:8.5f} {approach:9.4f} "
+            f"{n0:8.5f} {n2:8.5f} {w_abs:10.3e} {n2ss:8.5f} {approach_s:>9} "
             f"{p_sig_tot:11.4e} {g0_series[it]:11.4e}"
         )
 
@@ -917,7 +935,11 @@ def _sanity_checks_section(
     pump_abs = pump_in - pump_out
     ase_out = result.energy_ase_out_j
     sig_gain = result.energy_packet_out_j - result.energy_packet_in_j
-    ase_ok = ase_out <= pump_abs * 1.05 if pump_abs > 0 else ase_out < 1e-6
+    ase_ok = (
+        result.energy_balance_ok
+        if hasattr(result, "energy_balance_ok")
+        else (ase_out <= pump_abs * 1.05 if pump_abs > 0 else ase_out < 1e-6)
+    )
 
     stokes = hnu_p / max(hnu_s, 1e-30)
     budget = sig_gain + ase_out

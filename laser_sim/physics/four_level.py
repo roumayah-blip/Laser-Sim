@@ -56,18 +56,39 @@ def lifetimes_from_material(material: Material) -> FourLevelLifetimes:
 def pump_rate_per_ion(
     ip_w_m2: float,
     *,
-    gamma_p: float,
+    gamma_p: float = 1.0,
     sigma_p: float,
     sigma_ep: float,
     hnu_p: float,
 ) -> tuple[float, float]:
-    """(W_p,abs, W_p,esa) per ion for dN₃/dt = W_p,abs·N₀ − W_p,esa·N₃ − N₃/τ₃₂."""
-    w_p = gamma_p * ip_w_m2 / hnu_p
+    """
+    (W_p,abs, W_p,esa) per ion for dN₃/dt = W_p,abs·N₀ − W_p,esa·N₃ − N₃/τ₃₂.
+
+    ``ip_w_m2`` is pump intensity P/A_pump (cladding: A_clad; core-pumped: A_core).
+    Overlap Γ_p must not be applied again — it is already in α_p(z) via
+    ``advance_pump_power_z``. Core-local rates: σ·P/(hν·A_clad) = σ·Γ_p·P/(hν·A_core).
+    """
+    _ = gamma_p  # kept for call-site compatibility; not multiplied into rates
+    w_p = ip_w_m2 / hnu_p
     return w_p * sigma_p, w_p * sigma_ep
 
 
+def steady_state_n2_fraction_pump(
+    w_p_abs: float,
+    w_p_esa: float,
+    tau_21_s: float,
+) -> float:
+    """Upper-state fraction N₂/N_tot under pump only (includes pump stimulated emission)."""
+    return w_p_abs / (w_p_abs + w_p_esa + 1.0 / max(tau_21_s, 1e-30))
+
+
+def guided_fraction_into_mode(eta_guided: float, gamma_s: float) -> float:
+    """Fraction of N₂ spontaneous decay coupled into the guided signal/ASE mode."""
+    return float(np.clip(eta_guided * gamma_s, 0.0, 1.0))
+
+
 def field_rates_per_ion(
-    p_sig_row_w_nm: np.ndarray,
+    p_row_w_nm: np.ndarray,
     dlam: np.ndarray,
     sigma_e: np.ndarray,
     sigma_a: np.ndarray,
@@ -76,10 +97,40 @@ def field_rates_per_ion(
     gamma_s: float,
     a_signal: float,
 ) -> tuple[float, float]:
-    """(W_se, W_abs) coupling coefficients (s⁻¹). Quasi-2L: absorption from N₀."""
-    isig = np.clip(p_sig_row_w_nm / max(a_signal, 1e-30), 0.0, 1e18)
+    """(W_se, W_abs) coupling coefficients (s⁻¹) from one power-density row (W/nm)."""
+    isig = np.clip(p_row_w_nm / max(a_signal, 1e-30), 0.0, 1e18)
     w_se = gamma_s * float(np.sum(sigma_e * isig * dlam / hnu))
     w_abs = gamma_s * float(np.sum(sigma_a * isig * dlam / hnu))
+    return w_se, w_abs
+
+
+def combined_field_rates(
+    p_sig_row_w_nm: np.ndarray,
+    p_ase_row_w_nm: np.ndarray,
+    dlam: np.ndarray,
+    sigma_e: np.ndarray,
+    sigma_a: np.ndarray,
+    hnu: np.ndarray,
+    *,
+    gamma_s: float,
+    a_signal: float,
+    couple_signal: bool = True,
+    couple_ase: bool = True,
+) -> tuple[float, float]:
+    """Stimulated-emission / absorption rates from signal and ASE (incoherent sum)."""
+    w_se, w_abs = 0.0, 0.0
+    if couple_signal and p_sig_row_w_nm.size:
+        ws, wa = field_rates_per_ion(
+            p_sig_row_w_nm, dlam, sigma_e, sigma_a, hnu, gamma_s=gamma_s, a_signal=a_signal
+        )
+        w_se += ws
+        w_abs += wa
+    if couple_ase and p_ase_row_w_nm.size:
+        wa_se, wa_ab = field_rates_per_ion(
+            p_ase_row_w_nm, dlam, sigma_e, sigma_a, hnu, gamma_s=gamma_s, a_signal=a_signal
+        )
+        w_se += wa_se
+        w_abs += wa_ab
     return w_se, w_abs
 
 
@@ -186,19 +237,29 @@ def march_level_interval(
     hnu_p: float,
     a_signal: float,
     lifetimes: FourLevelLifetimes,
-    include_signal: bool,
+    include_signal: bool = True,
+    p_ase_row: np.ndarray | None = None,
+    couple_ase: bool = True,
 ) -> tuple[float, float, float]:
-    """Integrate rate equations over Δt at fixed z."""
+    """Integrate rate equations over Δt at fixed z (signal + ASE + pump + spontaneous)."""
     n_sub = _substeps_for_interval(dt, lifetimes)
     dt_sub = dt / n_sub
     w_p_abs, w_p_esa = pump_rate_per_ion(
         ip_w_m2, gamma_p=gamma_p, sigma_p=sigma_p, sigma_ep=sigma_ep, hnu_p=hnu_p
     )
-    w_se, w_abs = (0.0, 0.0)
-    if include_signal and p_sig_row.size:
-        w_se, w_abs = field_rates_per_ion(
-            p_sig_row, dlam, sigma_e, sigma_a, hnu, gamma_s=gamma_s, a_signal=a_signal
-        )
+    p_ase = p_ase_row if p_ase_row is not None else np.zeros_like(p_sig_row)
+    w_se, w_abs = combined_field_rates(
+        p_sig_row if include_signal else np.zeros_like(p_sig_row),
+        p_ase,
+        dlam,
+        sigma_e,
+        sigma_a,
+        hnu,
+        gamma_s=gamma_s,
+        a_signal=a_signal,
+        couple_signal=include_signal,
+        couple_ase=couple_ase and bool(p_ase.size),
+    )
 
     for _ in range(n_sub):
         n0, n2, n3 = _rk4_step_3level(
@@ -207,6 +268,62 @@ def march_level_interval(
             lifetimes=lifetimes,
         )
     return n0, n2, n3
+
+
+def march_level_interval_batch(
+    n0_batch: np.ndarray,
+    n2_batch: np.ndarray,
+    n_tot: float,
+    dt: float,
+    *,
+    ip_batch: np.ndarray,
+    p_sig_batch: np.ndarray,
+    dlam: np.ndarray,
+    sigma_e: np.ndarray,
+    sigma_a: np.ndarray,
+    hnu: np.ndarray,
+    gamma_p: float,
+    gamma_s: float,
+    sigma_p: float,
+    sigma_ep: float,
+    hnu_p: float,
+    a_signal: float,
+    lifetimes: FourLevelLifetimes,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Vectorised quasi-2L RK4 over a batch of active time bins.
+
+    Returns updated (n0_batch, n2_batch). N3 is held at 0 (QSS during signal).
+    """
+    w_p = ip_batch / hnu_p
+    w_pa = w_p * sigma_p
+
+    i_sig = p_sig_batch / a_signal
+    fac = gamma_s * dlam / hnu
+    w_se = np.sum(sigma_e * i_sig * fac, axis=1)
+    w_abs = np.sum(sigma_a * i_sig * fac, axis=1)
+
+    tau21 = lifetimes.tau_21_s
+
+    def deriv(n0: np.ndarray, n2: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        dn2 = -w_se * n2 + (w_abs + w_pa) * n0 - n2 / tau21
+        return -dn2, dn2
+
+    n0 = n0_batch.copy()
+    n2 = n2_batch.copy()
+    k0_0, k0_2 = deriv(n0, n2)
+    k1_0, k1_2 = deriv(n0 + 0.5 * dt * k0_0, n2 + 0.5 * dt * k0_2)
+    k2_0, k2_2 = deriv(n0 + 0.5 * dt * k1_0, n2 + 0.5 * dt * k1_2)
+    k3_0, k3_2 = deriv(n0 + dt * k2_0, n2 + dt * k2_2)
+
+    n0n = n0 + (dt / 6.0) * (k0_0 + 2 * k1_0 + 2 * k2_0 + k3_0)
+    n2n = n2 + (dt / 6.0) * (k0_2 + 2 * k1_2 + 2 * k2_2 + k3_2)
+    n0n = np.maximum(n0n, 0.0)
+    n2n = np.maximum(n2n, 0.0)
+    total = n0n + n2n
+    over = total > n_tot
+    scale = np.where(over, n_tot / total, 1.0)
+    return n0n * scale, n2n * scale
 
 
 def march_populations_pump_qss(
@@ -221,6 +338,7 @@ def march_populations_pump_qss(
     sigma_ep: float,
     hnu_p: float,
     lifetimes: FourLevelLifetimes,
+    initial_n2_fraction: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Pump-only causal march; N₃ QSS; N₁ = 0."""
     nt = t.size
@@ -230,7 +348,20 @@ def march_populations_pump_qss(
     n3 = np.zeros(nt, dtype=np.float64)
     n0 = np.zeros(nt, dtype=np.float64)
 
-    n0i, n2i, n3i = float(n_tot), 0.0, 0.0
+    f2 = float(np.clip(initial_n2_fraction, 0.0, 1.0))
+    n0i = float(n_tot) * (1.0 - f2)
+    n2i = float(n_tot) * f2
+    n3i = 0.0
+    if f2 <= 0.0 and nt > 0:
+        ip0 = float((p_pf[0] + p_pb[0]) * 0.5 / a_pump)
+        if ip0 > 0.0:
+            w0a, w0e = pump_rate_per_ion(
+                ip0, gamma_p=gamma_p, sigma_p=sigma_p, sigma_ep=sigma_ep, hnu_p=hnu_p
+            )
+            n2i = steady_state_n2_fraction_pump(w0a, w0e, lt.tau_21_s) * n_tot
+            n3i = w0a * n0i * lt.tau_32_s / (1.0 + w0e * lt.tau_32_s)
+            n2i = min(n2i, n_tot - n3i)
+            n0i = max(n_tot - n2i - n3i, 0.0)
     for it in range(nt):
         if it > 0:
             dt_i = float(t[it] - t[it - 1])
@@ -245,8 +376,9 @@ def march_populations_pump_qss(
             # n2_ss = W·τ / (1 + W·τ) · N_tot  -- saturates to N_tot at high pump.
             # Old formula n2_ss = W·N0·τ is wrong when W·τ >> 1 (pegs N2 to N_tot
             # via N0→0 lag, overshooting in one step).
-            _wt = w_p_abs * lt.tau_21_s
-            n2_ss = (_wt / (1.0 + _wt)) * n_tot
+            n2_ss = steady_state_n2_fraction_pump(
+                w_p_abs, w_p_esa, lt.tau_21_s
+            ) * n_tot
             n2i = n2_ss - (n2_ss - n2i) * np.exp(-dt_i / lt.tau_21_s)
             # Guard: N₂ cannot exceed (N_tot − N₃_ss)
             n2i = min(n2i, n_tot - n3_ss)
@@ -264,13 +396,18 @@ def advance_pump_power_z(
     dz: float,
     *,
     gamma_p: float = 1.0,
+    n2: np.ndarray | None = None,
+    sigma_ep: float | None = None,
 ) -> np.ndarray:
     """
-    Deplete pump along +z from ground-state absorption (m⁻¹).
+    Deplete pump along +z (m⁻¹).
 
-    α_p = Γ_p · σ_p · N₀; with N = κ_np/(Γ_p σ_p) and N₀ ≈ N_tot, α_p ≈ κ_np.
+    α_p = Γ_p · (σ_p·N₀ − σ_ep·N₂) when ``n2`` and ``sigma_ep`` are given;
+    otherwise α_p = Γ_p · σ_p · N₀.
     """
     alpha = gamma_p * sigma_p * np.maximum(n0, 0.0)
+    if n2 is not None and sigma_ep is not None:
+        alpha = alpha - gamma_p * sigma_ep * np.maximum(n2, 0.0)
     return np.maximum(p_in * np.exp(-alpha * dz), 0.0)
 
 

@@ -1,0 +1,231 @@
+================================================================================
+FIBER AMPLIFIER PHYSICS FIX — BRIEFING FOR CONTINUED DEVELOPMENT
+================================================================================
+Laser Sim (laser_sim/) — Yb fiber CPA / cladding-pumped amplifiers
+Date context: May 2026
+Reference case: Liekki YB1200-25/250, 10 W CW cladding pump @ 976 nm, L=0.7 m
+Gold standard: RP Fiber Power + first-principles brief (Fiber_Amplifier_Debugging_Brief.txt)
+
+================================================================================
+1. PROBLEM THAT WAS REPORTED
+================================================================================
+
+RP Fiber Power and analytical steady-state math for cladding-pumped 25/250 at
+976 nm predict:
+
+  - N₂/N_tot ≈ 40.3% at z = 0 with 10 W CW pump (P/P_sat,clad ≈ 2.1)
+  - Useful small-signal gain at 1030 nm over 0.7 m (~23 dB class)
+
+The custom simulator previously required ~70 W pump to approach transparency
+(~7× threshold). A prior in-repo note (CLADDING_PUMP_GAIN_THRESHOLD_25-250.md)
+claimed 10 W gives only ~2% inversion and that the simulator was "correct."
+That document is now known to be wrong — it repeated the same rate bug as the code.
+
+================================================================================
+2. ROOT CAUSES (CONFIRMED BY ANALYTICAL CHECKS)
+================================================================================
+
+BUG A — Double-counting Γ_p in per-ion pump transition rates (PRIMARY)
+
+  Call pattern:
+    ip = P_pump / A_clad          (cladding-pumped)
+    pump_rate_per_ion(ip, gamma_p=Γ_p, ...)
+
+  Old (wrong):
+    w_p,abs = Γ_p · ip / hν · σ_p
+            = Γ_p · P / (A_clad · hν) · σ_p     → ~100× too small for 25/250
+
+  Correct (equivalent forms):
+    w_p,abs = σ_p · P / (hν · A_clad)
+    w_p,abs = σ_p · Γ_p · P / (hν · A_core)
+
+  Γ_p belongs in spatial pump attenuation α_p(z) = Γ_p·(σ_p·N₀ − σ_ep·N₂), NOT
+  again in the intensity passed as P/A_clad.
+
+  At 10 W, 25/250: wrong w_abs ≈ 25 s⁻¹ → right w_abs ≈ 2500 s⁻¹.
+
+BUG B — Wrong pump-only steady-state N₂ formula
+
+  Old QSS in march_populations_pump_qss:
+    n₂_ss = (W·τ)/(1 + W·τ) · N_tot     [single-rate, no pump ESA]
+
+  Correct at 976 nm (σ_ep ≈ σ_ap):
+    n₂/N_tot = w_abs / (w_abs + w_esa + 1/τ)
+
+  Same as RP / brief:
+    n₂ = (P/P_sat) / [1 + (P/P_sat)·(1 + σ_ep/σ_ap)]
+
+  With BUG A fixed, this yields ~41% at 10 W (matches RP ~40.3%).
+
+BUG C — Pump z-propagation ignored bleaching (secondary)
+
+  Old: α_p = Γ_p · σ_p · N₀ only
+  Fixed: α_p = Γ_p · (σ_p·N₀ − σ_ep·N₂) when n₂ and σ_ep are passed into
+         advance_pump_power_z() from _pump_pass in fiber_cpa.py.
+
+BUG D — Signal pass overwrote pump populations incorrectly (diagnostics)
+
+  _signal_pass used a "running" N₀/N₂ state. After a signal/ASE coupled step
+  depleted inversion, later time bins with no signal still wrote the depleted
+  running state to the population arrays — averaging N₂ down to a few % even
+  when CW pump should hold ~40%.
+
+  Fix: snapshot n0_pump, n2_pump, n3_pump after pump pass; restore pump-pass
+  values whenever signal/ASE coupling is off; only advance running state during
+  coupled (signal/ASE) intervals.
+
+BUG E — Short CW time windows vs τ₂₁ (initialization)
+
+  Default time grids can be ~1 ms while Yb τ₂₁ ≈ 0.85–0.88 ms. Starting N₂=0
+  and relaxing in time undershoots steady state on that grid.
+
+  Fix: if initial_n2_fraction is 0 and pump power > 0 at t=0, initialize
+  populations to pump steady state (steady_state_n2_fraction_pump) in
+  march_populations_pump_qss (CPU + Taichi QSS kernel).
+
+================================================================================
+3. WHAT WAS CHANGED (FILES)
+================================================================================
+
+Core physics
+  laser_sim/physics/four_level.py
+    - pump_rate_per_ion(): no Γ_p on ip; w_p = ip/hν
+    - steady_state_n2_fraction_pump() [new]
+    - march_populations_pump_qss(): correct n₂_ss; CW t=0 init
+    - advance_pump_power_z(): optional bleaching term
+    - march_level_interval_batch(): ip/hν without Γ_p
+
+  laser_sim/physics/fiber_cpa.py
+    - Saturation warning uses n₂_ss vs β_t (not W·τ << 1 false alarm)
+    - _pump_pass passes n₂ into advance_pump_power_z
+    - _signal_pass: n0_pump/n2_pump restore when uncoupled
+
+  laser_sim/physics/taichi_kernels.py
+    - QSS march: rates without Γ_p; correct n₂_ss; CW t=0 init
+    - (pump advance kernels still α_p = Γ_p·σ_p·N₀ — bleaching in CPU path)
+
+  laser_sim/physics/taichi_solver.py
+    - Same saturation warning logic as fiber_cpa
+
+  laser_sim/physics/rep_rate_warmup.py
+    - Pump rates and n₂_ss without Γ_p; sigma_ep parameter
+
+  laser_sim/gui/runner.py
+    - Warmup / initial_n2 uses pump_rate_per_ion + steady_state_n2_fraction_pump
+    - Passes sigma_ep into warmup solver
+
+  hybrid_sim/physics/four_level.py
+    - Mirror of laser_sim four_level fixes (hybrid GUI path)
+
+Tests
+  tests/test_cladding_pump_inversion.py  [NEW]
+    - 10 W, 25/250, yb_glass → n₂ ≈ 40% vs analytic / RP brief
+  tests/test_rep_rate_warmup.py
+    - Updated for new pump SS formula
+
+NOT updated (may still be misleading)
+  CLADDING_PUMP_GAIN_THRESHOLD_25-250.md
+    - Still asserts 2% inversion at 10 W; contradicts fixed physics.
+    - Treat as obsolete unless rewritten.
+
+================================================================================
+4. CURRENT EXPECTED BEHAVIOR (BENCHMARK CASE)
+================================================================================
+
+Fiber: 25 µm core / 250 µm clad, cladding-pumped
+Pump: 10 W CW @ 976 nm
+κ: ~14.6 dB/m (from pump_absorption_db_per_m → N_tot via Γ_p·σ_p·N)
+Material: yb_glass (Liekki_Yb.inc cross-sections)
+
+After fixes (pump pass only, z = 0):
+  N₂/N_tot ≈ 36–41% (depends on σ table and time-grid averaging)
+  Analytical: ~40.5% with brief’s P_sat,clad formula
+  RP reference: 40.31% at z = 0
+
+Saturation warning at 10 W should NOT fire the old
+  "W_p·τ << 1, need ~70 W" message.
+
+================================================================================
+5. HOW TO COMPARE TO RP / READ DIAGNOSTICS
+================================================================================
+
+Use populations AFTER pump pass, not time-averaged populations after signal:
+
+  result.populations_after_pump.n2_fraction[z, :]
+
+RP steady-state at z = 0 is pump-only (negligible signal). The field
+result.populations includes signal-induced depletion during pulse bins.
+
+For GUI / runner:
+  SimInputs: material_key="yb_glass", cladding_pumped=True,
+             core_diameter_um=25, cladding_diameter_um=250,
+             pump_peak_power_w=10, pump_cw=True,
+             pump_absorption_db_per_m=14.6, pump_wavelength_nm=976,
+             fiber_length_m=0.7, signal_center_nm=1030
+
+Regression test:
+  python3 -m pytest tests/test_cladding_pump_inversion.py -q
+
+Intensity convention (must stay consistent):
+  Cladding pump: a_pump = A_clad, ip = P/A_clad, rates WITHOUT extra Γ_p
+  Core pump:     a_pump = A_core, ip = P/A_core, rates WITHOUT Γ_p (Γ_p=1)
+  Z attenuation: α_p uses Γ_p on (σ_p N₀ − σ_ep N₂)
+
+N_tot from datasheet:
+  N = α_np / (Γ_p · σ_p)   with α_np = (dB/m) / DB_PER_NP
+  Do NOT apply Γ_p twice in both N and pump rates.
+
+================================================================================
+6. RATE EQUATION STRUCTURE (QUICK REFERENCE)
+================================================================================
+
+Quasi-two-level Yb (N₁ skipped): N₀ + N₂ + N₃ = N_tot
+
+Per-ion pump (ip = P/A_pump):
+  w_p_abs = (ip/hν) · σ_p
+  w_p_esa = (ip/hν) · σ_ep
+
+Pump-only steady state (for QSS march / init):
+  n₂_frac = w_p_abs / (w_p_abs + w_p_esa + 1/τ₂₁)
+
+Full interval (signal + ASE): RK4 in march_level_interval() with w_p_abs,
+  w_p_esa, w_se, w_abs — unchanged structure, fixed rate magnitudes.
+
+Pump power along z:
+  P(z+Δz) = P(z) · exp(−α_p Δz)
+  α_p = Γ_p · (σ_p·N₀ − σ_ep·N₂)   [when n₂ supplied]
+
+Signal pass:
+  - Gain slab: g = Γ_s · (σ_e N₂ − σ_a N₀)
+  - Populations: pump snapshot restored between coupled intervals
+
+================================================================================
+7. KNOWN LIMITATIONS / FOLLOW-UPS
+================================================================================
+
+- Taichi pump-advance kernels may still use α_p = Γ_p·σ_p·N₀ only (no bleaching
+  in GPU pump pass); CPU fiber_cpa path has bleaching.
+
+- Energy-budget warnings can still appear on some grid/packet settings after the
+  fix (check saturation and time resolution if emission >> pump absorbed).
+
+- Rep-rate warmup test no longer requires exact match to uniform n₂_ss(z) along
+  fiber (extraction along z changes spatial profile).
+
+- hybrid_sim/ mirrors four_level; verify hybrid GUI if used separately.
+
+- Rewrite or archive CLADDING_PUMP_GAIN_THRESHOLD_25-250.md to avoid confusion.
+
+- Optional: export pump-pass N₂ in diagnostics TXT by default for RP comparison.
+
+================================================================================
+8. CONVERSATION / DEBUG ARTIFACTS
+================================================================================
+
+User brief: Fiber_Amplifier_Debugging_Brief.txt (Downloads)
+Prior wrong analysis: CLADDING_PUMP_GAIN_THRESHOLD_25-250.md
+Agent transcript: .cursor/projects/.../agent-transcripts/425a99e8-...jsonl
+
+================================================================================
+END OF BRIEF
+================================================================================
