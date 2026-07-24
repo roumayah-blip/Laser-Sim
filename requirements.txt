@@ -5,3 +5,5 @@ plotly>=5.18
 h5py>=3.9
 taichi>=1.7.0
 dearpygui>=1.11
+python-pptx>=0.6.21
+matplotlib>=3.7

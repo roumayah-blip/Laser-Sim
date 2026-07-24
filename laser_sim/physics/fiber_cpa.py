@@ -10,6 +10,7 @@ Quasi-two-level (N₁ skipped, τ₁₀→0): N₀, N₃, N₂.
 from __future__ import annotations
 
 import warnings
+from collections.abc import Callable
 from dataclasses import dataclass, field
 import numpy as np
 
@@ -78,6 +79,8 @@ class FiberCPAConfig:
     use_group_velocity_walkoff: bool = False
     use_nonlinear: bool = False
     lp_modes: list | None = None
+    signal_channels: list = field(default_factory=list)
+    pump_channels: list = field(default_factory=list)
 
 
 @dataclass
@@ -131,6 +134,12 @@ class FiberCPAResult:
     lp_modes: list | None = None
     gamma_signal_per_mode: np.ndarray | None = None
     populations_after_pump: FourLevelPopulations | None = None
+    signal_channels_info: list = field(default_factory=list)
+    pump_channels_info: list = field(default_factory=list)
+
+
+def _multichannel_mode(cfg: FiberCPAConfig) -> bool:
+    return bool(cfg.signal_channels) or bool(cfg.pump_channels)
 
 
 def _build_grids(cfg: FiberCPAConfig) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -206,38 +215,35 @@ def _pump_pass(
     if backward_pump:
         p_p_bwd[-1] = p_p_in * backward_fraction
 
-    for iz in range(nz):
-        if iz == 0 or iz == nz - 1 or iz % max(1, nz // 20) == 0:
-            frac = progress_base + progress_span * (iz + 1) / max(nz, 1)
-            emit_progress(progress_callback, frac, f"Pump pass: z slice {iz + 1}/{nz}")
-        f2_iz = float(init_z[iz]) if init_z is not None else float(initial_n2_fraction)
-        n0[iz], n1[iz], n2[iz], n3[iz] = march_populations_pump_qss(
-            t,
-            p_p_fwd[iz],
-            p_p_bwd[iz],
-            n_tot=n_tot,
-            a_pump=a_pump,
-            gamma_p=gamma_p,
-            sigma_p=sigma_p,
-            sigma_ep=sigma_ep,
-            hnu_p=hnu_p,
-            lifetimes=lifetimes,
-            initial_n2_fraction=f2_iz,
-        )
-        if iz >= nz - 1:
-            continue
-        p_p_fwd[iz + 1] = advance_pump_power_z(
-            p_p_fwd[iz],
-            n0[iz],
-            sigma_p,
-            dz,
-            gamma_p=gamma_p,
-            n2=n2[iz],
-            sigma_ep=sigma_ep,
-        )
-        if backward_pump and backward_fraction > 0:
-            p_p_bwd[iz] = advance_pump_power_z(
-                p_p_bwd[iz + 1],
+    # A backward pump propagates along −z, so it needs a reverse z-sweep.
+    # Populations depend on both fields, so iterate forward-march + backward
+    # sweep to self-consistency (3 sweeps converge well for moderate α_p·L).
+    has_bwd = backward_pump and backward_fraction > 0.0
+    n_sweeps = 3 if has_bwd else 1
+    for sweep in range(n_sweeps):
+        last_sweep = sweep == n_sweeps - 1
+        for iz in range(nz):
+            if last_sweep and (iz == 0 or iz == nz - 1 or iz % max(1, nz // 20) == 0):
+                frac = progress_base + progress_span * (iz + 1) / max(nz, 1)
+                emit_progress(progress_callback, frac, f"Pump pass: z slice {iz + 1}/{nz}")
+            f2_iz = float(init_z[iz]) if init_z is not None else float(initial_n2_fraction)
+            n0[iz], n1[iz], n2[iz], n3[iz] = march_populations_pump_qss(
+                t,
+                p_p_fwd[iz],
+                p_p_bwd[iz],
+                n_tot=n_tot,
+                a_pump=a_pump,
+                gamma_p=gamma_p,
+                sigma_p=sigma_p,
+                sigma_ep=sigma_ep,
+                hnu_p=hnu_p,
+                lifetimes=lifetimes,
+                initial_n2_fraction=f2_iz,
+            )
+            if iz >= nz - 1:
+                continue
+            p_p_fwd[iz + 1] = advance_pump_power_z(
+                p_p_fwd[iz],
                 n0[iz],
                 sigma_p,
                 dz,
@@ -245,6 +251,17 @@ def _pump_pass(
                 n2=n2[iz],
                 sigma_ep=sigma_ep,
             )
+        if has_bwd:
+            for iz in range(nz - 2, -1, -1):
+                p_p_bwd[iz] = advance_pump_power_z(
+                    p_p_bwd[iz + 1],
+                    n0[iz],
+                    sigma_p,
+                    dz,
+                    gamma_p=gamma_p,
+                    n2=n2[iz],
+                    sigma_ep=sigma_ep,
+                )
 
     return p_p_fwd, p_p_bwd, n0, n1, n2, n3
 
@@ -356,6 +373,8 @@ def _deplete_populations_from_ase_slab(
     p_ase_f: np.ndarray,
     p_ase_b: np.ndarray,
     ase_threshold_w: float = 1e-6,
+    pump_channel_rows: list | None = None,
+    t_s: np.ndarray | None = None,
 ) -> None:
     """RK4 over slab transit: ASE stimulated emission depletes N₂ (active bins only)."""
     if dt_slab <= 0.0:
@@ -394,6 +413,9 @@ def _deplete_populations_from_ase_slab(
             lifetimes=lifetimes,
             include_signal=False,
             couple_ase=True,
+            pump_channel_rows=pump_channel_rows,
+            pump_time_index=int(it),
+            pump_time_s=t_s,
         )
         n0[iz, it] = n0i
         n2[iz, it] = n2i
@@ -433,6 +455,7 @@ def _signal_pass(
     progress_callback: ProgressCallback | None = None,
     progress_base: float = 0.38,
     progress_span: float = 0.54,
+    pump_channel_rows_provider: Callable[[int], list] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     nz, nt, nlam = z.size, t.size, wl.size
     p_s = np.zeros((nz, nt, nlam))
@@ -495,6 +518,15 @@ def _signal_pass(
                     couple_ase = include_ase and ase_w >= ase_threshold_w
 
                     if couple_sig or couple_ase:
+                        # Multi-channel pump rates (if any) are summed inside
+                        # march_level_interval; outside coupled intervals the
+                        # populations revert to the pump-pass (QSS) values,
+                        # which already include every pump channel.
+                        pump_rows = (
+                            pump_channel_rows_provider(iz)
+                            if pump_channel_rows_provider is not None
+                            else None
+                        )
                         if not in_coupled_interval:
                             n0_run = float(n0_pump[iz, it])
                             n2_run = float(n2_pump[iz, it])
@@ -524,6 +556,9 @@ def _signal_pass(
                             lifetimes=lifetimes,
                             include_signal=couple_sig,
                             couple_ase=couple_ase,
+                            pump_channel_rows=pump_rows,
+                            pump_time_index=it,
+                            pump_time_s=t,
                         )
                         n0i, n2i, n3i = n0_run, n2_run, n3_run
                     else:
@@ -564,6 +599,12 @@ def _signal_pass(
                     n3=n3,
                     n_tot=n_tot,
                     dt_slab=dt_travel,
+                    pump_channel_rows=(
+                        pump_channel_rows_provider(iz)
+                        if pump_channel_rows_provider is not None
+                        else None
+                    ),
+                    t_s=t,
                     dlam=dlam,
                     sigma_e=sigma_e,
                     sigma_a=sigma_a,
@@ -590,6 +631,15 @@ def run_fiber_cpa(
     backend: str = "cpu",
     progress_callback: ProgressCallback | None = None,
 ) -> FiberCPAResult:
+    if _multichannel_mode(cfg):
+        if backend == "taichi":
+            warnings.warn(
+                "Multi-channel mode uses the CPU solver (Taichi path not implemented).",
+                stacklevel=2,
+            )
+        from laser_sim.physics.fiber_cpa_multichannel import run_fiber_cpa_multichannel
+
+        return run_fiber_cpa_multichannel(cfg, progress_callback=progress_callback)
     if backend == "taichi":
         from laser_sim.physics.taichi_isolated import run_fiber_cpa_taichi_isolated
         from laser_sim.physics.taichi_solver import run_fiber_cpa_taichi, use_isolated_taichi

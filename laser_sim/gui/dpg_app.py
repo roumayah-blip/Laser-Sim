@@ -40,6 +40,7 @@ _SPEC_IN_SERIES = "spec_in_series"
 _SPEC_OUT_SERIES = "spec_out_series"
 
 _last_outcome: dict[str, SimRunOutcome | None] = {"value": None}
+_last_inputs: dict[str, SimInputs | None] = {"value": None}
 
 
 def _log(msg: str, clear: bool = False) -> None:
@@ -197,6 +198,39 @@ def _on_rep_rate_ui_change() -> None:
         )
 
 
+def _on_export_pptx() -> None:
+    out = _last_outcome.get("value")
+    if out is None or not out.ok or out.result is None:
+        _log("Run a simulation first before exporting PowerPoint.\n")
+        return
+    try:
+        from datetime import datetime, timezone
+        from pathlib import Path
+
+        from laser_sim.exporters.powerpoint import SlideOptions, build_amplifier_slide
+
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        path = (
+            Path(__file__).resolve().parents[2]
+            / "diagnostics_output"
+            / f"amplifier_summary_{stamp}.pptx"
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        inp = _last_inputs.get("value")
+        if inp is None:
+            inp = _read_inputs()
+        build_amplifier_slide(
+            inp,
+            out,
+            SlideOptions(output_path=str(path)),
+        )
+        _log(f"PowerPoint saved: {path}\n")
+    except ImportError as exc:
+        _log(f"Install python-pptx: pip install python-pptx ({exc})\n")
+    except Exception as exc:
+        _log(f"PowerPoint export failed: {exc}\n")
+
+
 def _on_apply_flat_weights() -> None:
     out = _last_outcome.get("value")
     if out is None or out.suggested_flat_weights is None:
@@ -265,6 +299,7 @@ def _on_run() -> None:
     dpg.set_value("metrics_text", summary)
     dpg.set_value("status_text", "OK")
     _last_outcome["value"] = outcome
+    _last_inputs["value"] = inp
     _log("Simulation finished successfully.\n")
     _log(summary + "\n")
     if outcome.suggested_flat_weights is not None:
@@ -443,6 +478,11 @@ def _build_ui() -> None:
                 dpg.add_button(
                     label="Apply flat-packet weights to next run",
                     callback=_on_apply_flat_weights,
+                    width=280,
+                )
+                dpg.add_button(
+                    label="Export PowerPoint summary (.pptx)",
+                    callback=_on_export_pptx,
                     width=280,
                 )
                 dpg.add_button(label="Clear log", callback=_on_clear_log, width=200)

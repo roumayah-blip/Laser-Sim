@@ -30,12 +30,13 @@ from laser_sim.gui.backend_status import probe_compute_backend
 from laser_sim.gui.fiber_presets import load_presets, preset_to_session_updates, save_preset
 from laser_sim.gui.runner import (
     SimInputs,
+    SimRunOutcome,
     format_cw_reference_summary,
     format_energy_summary,
     run_simulation,
 )
 from laser_sim.materials import load_material
-from laser_sim.pulses.chirp import ChirpedBurstSpec, time_resolution_preset
+from laser_sim.pulses.chirp import ChirpedBurstSpec, packet_duration_s, time_resolution_preset
 from laser_sim.viz.plot_limits import (
     apply_plotly_spectrum_layout,
     apply_plotly_temporal_dual_axis,
@@ -59,7 +60,11 @@ def _render_flat_packet_weights_ui(outcome, *, button_key: str) -> None:
             f"(peak/mean {max(w) / max(min(w), 1e-30):.2f}×)"
         )
         if st.button("⟳ Apply flat-packet weights to next run", key=button_key):
-            st.session_state["pulse_weights"] = w_apply
+            # Can't write st.session_state["pulse_weights"] here: that widget
+            # (key="pulse_weights") already instantiated earlier in this same
+            # script run. Stash the value and apply it before the widget is
+            # created on the next run instead (see tab_run, near the top).
+            st.session_state["_pulse_weights_pending"] = w_apply
             st.rerun()
         return
     r = outcome.result
@@ -74,6 +79,47 @@ def _render_flat_packet_weights_ui(outcome, *, button_key: str) -> None:
         st.caption(
             "Flat-packet weights unavailable (per-pulse energies missing from this backend)."
         )
+
+
+def _diagnostics_output_dir() -> Path:
+    return Path(__file__).resolve().parents[2] / "diagnostics_output"
+
+
+def _save_powerpoint_slide(inp: SimInputs, outcome: SimRunOutcome, material_label: str) -> str:
+    from datetime import datetime, timezone
+
+    from laser_sim.exporters.powerpoint import SlideOptions, build_amplifier_slide
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    out_pptx = _diagnostics_output_dir() / f"amplifier_summary_{stamp}.pptx"
+    out_pptx.parent.mkdir(parents=True, exist_ok=True)
+    return build_amplifier_slide(
+        inp,
+        outcome,
+        SlideOptions(
+            title="Yb Fiber CPA Simulation",
+            subtitle=f"{material_label} · {inp.fiber_length_m * 1000:.0f} mm fiber",
+            output_path=str(out_pptx),
+        ),
+    )
+
+
+def _render_pptx_export_status() -> None:
+    """Show last successful .pptx path and download (persists across reruns)."""
+    pptx_path = st.session_state.get("last_pptx_path")
+    if pptx_path and Path(pptx_path).is_file():
+        st.success(f"PowerPoint saved: `{pptx_path}`")
+        with open(pptx_path, "rb") as f:
+            st.download_button(
+                "Download .pptx",
+                f.read(),
+                file_name=Path(pptx_path).name,
+                mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                key="download_last_pptx",
+            )
+    err = st.session_state.get("last_pptx_error")
+    if err:
+        st.error(f"PowerPoint export failed: {err}")
 
 
 st.set_page_config(page_title="Laser Sim — CPA Fiber", layout="wide")
@@ -356,6 +402,13 @@ with tab_run:
     st.subheader("Simulation parameters")
     st.info("Use the **Calculators** tab for grid size and runtime; values below drive the physics run.")
 
+    # Apply any "flat-packet weights" requested via the button further down,
+    # before the pulse_weights text_input widget below is instantiated —
+    # writing to st.session_state["pulse_weights"] after that widget exists
+    # in this run raises StreamlitAPIException.
+    if "_pulse_weights_pending" in st.session_state:
+        st.session_state["pulse_weights"] = st.session_state.pop("_pulse_weights_pending")
+
     r1, r2, r3 = st.columns(3)
     with r1:
         pump_peak_w = st.number_input("Pump peak power (W)", 0.1, 5000.0, 80.0, 1.0)
@@ -590,6 +643,224 @@ with tab_run:
             key="passive_after",
         )
 
+    multichannel_mode = st.checkbox(
+        "Multi-channel mode",
+        value=False,
+        help="Use signal_channels / pump_channels lists instead of single-channel inputs.",
+    )
+    if multichannel_mode:
+        st.caption(
+            "Single-channel fields below are ignored. Configure channels in the expander."
+        )
+        st.session_state.setdefault("mc_sig_ids", [0])
+        st.session_state.setdefault("mc_next_sig_id", 1)
+        st.session_state.setdefault("mc_pump_ids", [0])
+        st.session_state.setdefault("mc_next_pump_id", 1)
+
+        with st.expander("Multi-channel setup", expanded=True):
+            st.markdown("**Signal channels**")
+            sig_mc_inputs: list[dict] = []
+            for cid in list(st.session_state.mc_sig_ids):
+                st.divider()
+                hdr, rm = st.columns([5, 1])
+                with hdr:
+                    sig_name = st.text_input(
+                        "Name", f"signal_{cid + 1}", key=f"mc_sig_name_{cid}"
+                    )
+                with rm:
+                    st.write("")
+                    if st.button("Remove", key=f"mc_sig_rm_{cid}"):
+                        if len(st.session_state.mc_sig_ids) > 1:
+                            st.session_state.mc_sig_ids.remove(cid)
+                            st.rerun()
+                        else:
+                            st.warning("At least one signal channel is required.")
+                sig_enabled = st.checkbox("Enabled", True, key=f"mc_sig_en_{cid}")
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    nm = st.number_input(
+                        "Center λ (nm)", 900.0, 1100.0, 1030.0, key=f"mc_sig_nm_{cid}"
+                    )
+                    bw = st.number_input(
+                        "Bandwidth (nm)", 0.5, 40.0, 8.0, key=f"mc_sig_bw_{cid}"
+                    )
+                with c2:
+                    spec_shape = st.selectbox(
+                        "Spectral shape", ["gaussian", "flat"], key=f"mc_sig_shape_{cid}"
+                    )
+                    sig_mode = st.selectbox(
+                        "Mode", ["Pulsed", "CW (average power)"], key=f"mc_sig_mode_{cid}"
+                    )
+                with c3:
+                    lam_win = st.number_input(
+                        "λ half-window (nm)",
+                        1.0,
+                        30.0,
+                        4.0,
+                        key=f"mc_sig_lamwin_{cid}",
+                        help="Must not overlap other channels' windows.",
+                    )
+                sig_spec_d: dict = {
+                    "center_wavelength_nm": float(nm),
+                    "bandwidth_nm": float(bw),
+                    "spectral_shape": spec_shape,
+                }
+                if sig_mode.startswith("CW"):
+                    w1, w2 = st.columns(2)
+                    with w1:
+                        avg_p_w = st.number_input(
+                            "Average power (W)", 0.001, 5000.0, 1.0, key=f"mc_sig_cwp_{cid}"
+                        )
+                    with w2:
+                        cw_t0_us = st.number_input(
+                            "Start time (µs)", 0.0, 5000.0, 0.0, key=f"mc_sig_cwt0_{cid}"
+                        )
+                    # effective_period only depends on default burst timing fields
+                    # (packet_average_power_w in cw_average.py) — packet_energy_j
+                    # here is just the vehicle for the requested average power.
+                    _dummy_spec = ChirpedBurstSpec()
+                    _eff_period_s = max(
+                        packet_duration_s(_dummy_spec),
+                        _dummy_spec.burst_spacing_s,
+                        10 * _dummy_spec.chirp_duration_s,
+                    )
+                    sig_spec_d.update(
+                        cw_average_power_mode=True,
+                        packet_energy_j=float(avg_p_w) * _eff_period_s,
+                        burst_start_time_s=float(cw_t0_us) * 1e-6,
+                    )
+                else:
+                    q1, q2, q3 = st.columns(3)
+                    with q1:
+                        e_uj = st.number_input(
+                            "Packet E (µJ)", 0.01, 500.0, 10.0, key=f"mc_sig_e_{cid}"
+                        )
+                        nb = st.number_input(
+                            "Burst count", 1, 20, 5, key=f"mc_sig_nb_{cid}"
+                        )
+                    with q2:
+                        t0_us = st.number_input(
+                            "Burst start (µs)", 0.0, 5000.0, 200.0, key=f"mc_sig_t0_{cid}"
+                        )
+                        sp_ns = st.number_input(
+                            "Burst spacing (ns)", 0.5, 100.0, 1.0, key=f"mc_sig_sp_{cid}"
+                        )
+                    with q3:
+                        chirp_ns = st.number_input(
+                            "Chirp (ns)", 0.5, 20.0, 0.8, key=f"mc_sig_chirp_{cid}"
+                        )
+                    sig_spec_d.update(
+                        packet_energy_j=float(e_uj) * 1e-6,
+                        burst_count=int(nb),
+                        burst_spacing_s=float(sp_ns) * 1e-9,
+                        burst_start_time_s=float(t0_us) * 1e-6,
+                        chirp_duration_s=float(chirp_ns) * 1e-9,
+                    )
+                sig_mc_inputs.append(
+                    {
+                        "name": sig_name,
+                        "enabled": bool(sig_enabled),
+                        "lambda_half_window_nm": float(lam_win),
+                        "spec": sig_spec_d,
+                    }
+                )
+            if st.button("+ Add signal channel"):
+                st.session_state.mc_sig_ids.append(st.session_state.mc_next_sig_id)
+                st.session_state.mc_next_sig_id += 1
+                st.rerun()
+
+            st.markdown("**Pump channels**")
+            pump_mc_inputs: list[dict] = []
+            for cid in list(st.session_state.mc_pump_ids):
+                st.divider()
+                phdr, prm = st.columns([5, 1])
+                with phdr:
+                    pump_name = st.text_input(
+                        "Name", f"pump_{cid + 1}", key=f"mc_pump_name_{cid}"
+                    )
+                with prm:
+                    st.write("")
+                    if st.button("Remove", key=f"mc_pump_rm_{cid}"):
+                        if len(st.session_state.mc_pump_ids) > 1:
+                            st.session_state.mc_pump_ids.remove(cid)
+                            st.rerun()
+                        else:
+                            st.warning("At least one pump channel is required.")
+                pump_enabled = st.checkbox("Enabled", True, key=f"mc_pump_en_{cid}")
+                p1, p2, p3 = st.columns(3)
+                with p1:
+                    pwl = st.number_input(
+                        "Pump λ (nm)", 850.0, 990.0, 976.0, key=f"mc_pwl_{cid}"
+                    )
+                    ppw = st.number_input(
+                        "Peak power (W)", 0.1, 5000.0, 80.0, key=f"mc_ppw_{cid}"
+                    )
+                with p2:
+                    pump_mode = st.selectbox("Mode", ["CW", "Pulsed"], key=f"mc_pmode_{cid}")
+                    pclad = st.checkbox(
+                        "Cladding pumped", True, key=f"mc_pclad_{cid}"
+                    )
+                with p3:
+                    pbwd = st.number_input(
+                        "Backward fraction", 0.0, 1.0, 0.0, key=f"mc_pbwd_{cid}"
+                    )
+                pump_spec_d: dict = {
+                    "wavelength_nm": float(pwl),
+                    "peak_power_w": float(ppw),
+                    "cw": pump_mode == "CW",
+                }
+                if pump_mode == "CW":
+                    win_ms = st.number_input(
+                        "Sim window (ms)", 0.1, 5000.0, 5.0, key=f"mc_pwin_{cid}"
+                    )
+                    pump_spec_d["duration_s"] = float(win_ms) * 1e-3
+                else:
+                    s1, s2, s3 = st.columns(3)
+                    with s1:
+                        pshape = st.selectbox(
+                            "Shape",
+                            ["flat_top", "gaussian", "trapezoid"],
+                            key=f"mc_pshape_{cid}",
+                        )
+                    with s2:
+                        pdur_us = st.number_input(
+                            "Duration (µs)", 1.0, 5000.0, 1000.0, key=f"mc_pdur_{cid}"
+                        )
+                        pstart_us = st.number_input(
+                            "Start time (µs)", 0.0, 5000.0, 0.0, key=f"mc_pstart_{cid}"
+                        )
+                    with s3:
+                        pedge_us = st.number_input(
+                            "Edge time (µs)",
+                            0.1,
+                            1000.0,
+                            50.0,
+                            key=f"mc_pedge_{cid}",
+                            disabled=(pshape != "trapezoid"),
+                        )
+                    pump_spec_d.update(
+                        shape=pshape,
+                        duration_s=float(pdur_us) * 1e-6,
+                        start_time_s=float(pstart_us) * 1e-6,
+                        edge_time_s=float(pedge_us) * 1e-6,
+                    )
+                pump_mc_inputs.append(
+                    {
+                        "name": pump_name,
+                        "enabled": bool(pump_enabled),
+                        "cladding_pumped": pclad,
+                        "backward_fraction": float(pbwd),
+                        "spec": pump_spec_d,
+                    }
+                )
+            if st.button("+ Add pump channel"):
+                st.session_state.mc_pump_ids.append(st.session_state.mc_next_pump_id)
+                st.session_state.mc_next_pump_id += 1
+                st.rerun()
+    else:
+        sig_mc_inputs = []
+        pump_mc_inputs = []
+
     run_btn = st.button("Run CPA simulation", type="primary")
 
     if run_btn:
@@ -652,6 +923,9 @@ with tab_run:
             pulse_relative_powers=pulse_weights,
             time_resolution=time_resolution,
             steady_state_warmup=bool(steady_state_warmup),
+            multichannel_mode=bool(multichannel_mode),
+            signal_channels_inputs=sig_mc_inputs if multichannel_mode else None,
+            pump_channels_inputs=pump_mc_inputs if multichannel_mode else None,
         )
 
         plot_spec = ChirpedBurstSpec(
@@ -679,6 +953,8 @@ with tab_run:
         progress_caption.markdown("**100%** — Simulation complete")
         st.session_state["last_sim_outcome"] = outcome
         st.session_state["last_sim_inputs"] = inp
+        st.session_state.pop("last_pptx_path", None)
+        st.session_state.pop("last_pptx_error", None)
 
         if not outcome.ok:
             st.error(f"Simulation failed: **{outcome.error_type}** — {outcome.error_message}")
@@ -686,8 +962,49 @@ with tab_run:
                 st.code(outcome.traceback_text)
             st.stop()
 
-        result = outcome.result
-        st.success("Simulation complete")
+    # Persisted results / export (survive Streamlit reruns until the next Run).
+    _outcome = st.session_state.get("last_sim_outcome")
+    _inp = st.session_state.get("last_sim_inputs")
+
+    if _outcome is not None and _inp is not None:
+        if not _outcome.ok:
+            st.error(
+                f"Last run failed: **{_outcome.error_type}** — {_outcome.error_message}"
+            )
+            with st.expander("Last run traceback", expanded=False):
+                st.code(_outcome.traceback_text or "")
+        elif _outcome.result is not None:
+            st.divider()
+            st.subheader("Last simulation results")
+            st.caption(
+                "Results stay visible until you click **Run CPA simulation** again. "
+                f"PowerPoint files are written under `{_diagnostics_output_dir()}/`."
+            )
+            _toolbar_left, _toolbar_right = st.columns([1, 2])
+            with _toolbar_left:
+                if st.button(
+                    "Export PowerPoint summary (.pptx)",
+                    key="export_pptx_persist",
+                ):
+                    try:
+                        st.session_state["last_pptx_path"] = _save_powerpoint_slide(
+                            _inp, _outcome, mat_key
+                        )
+                        st.session_state.pop("last_pptx_error", None)
+                    except ImportError as exc:
+                        st.session_state["last_pptx_error"] = (
+                            f"Install python-pptx: pip install python-pptx ({exc})"
+                        )
+                    except Exception as exc:
+                        st.session_state["last_pptx_error"] = str(exc)
+            with _toolbar_right:
+                _render_pptx_export_status()
+            _render_flat_packet_weights_ui(_outcome, button_key="apply_flat_weights_persist")
+
+            outcome = _outcome
+            inp = _inp
+            result = outcome.result
+            st.success("Simulation complete")
         if outcome.backend_used:
             arch_note = f" (Taichi {outcome.taichi_arch})" if outcome.taichi_arch else ""
             st.caption(
@@ -695,7 +1012,6 @@ with tab_run:
                 + (f" · wall time **{outcome.wall_time_s:.2f} s**" if outcome.wall_time_s else "")
             )
         st.text(format_energy_summary(outcome))
-        _render_flat_packet_weights_ui(outcome, button_key="apply_flat_weights_run")
         cw_line = format_cw_reference_summary(outcome)
         if cw_line:
             st.info(cw_line)
@@ -859,62 +1175,163 @@ with tab_run:
         )
         st.plotly_chart(fig_pump, use_container_width=True)
 
-        p_in_t = integrated_power_vs_time(sig_in, wl)
-        p_out_t = integrated_power_vs_time(sig_out, wl)
-        t_rel, p_in_w, p_out_w, xlim_ns = sample_temporal_traces(t, p_in_t, p_out_t, plot_spec)
+        if not inp.multichannel_mode:
+            p_in_t = integrated_power_vs_time(sig_in, wl)
+            p_out_t = integrated_power_vs_time(sig_out, wl)
+            t_rel, p_in_w, p_out_w, xlim_ns = sample_temporal_traces(t, p_in_t, p_out_t, plot_spec)
 
-        fig_t = go.Figure()
-        fig_t.add_trace(
-            go.Scatter(
-                x=t_rel,
-                y=p_in_w,
-                name="Signal in",
-                line=dict(color="#636EFA"),
+            fig_t = go.Figure()
+            fig_t.add_trace(
+                go.Scatter(
+                    x=t_rel,
+                    y=p_in_w,
+                    name="Signal in",
+                    line=dict(color="#636EFA"),
+                )
             )
-        )
-        fig_t.add_trace(
-            go.Scatter(
-                x=t_rel,
-                y=p_out_w,
-                name="Signal out",
-                yaxis="y2",
-                line=dict(color="#EF553B"),
+            fig_t.add_trace(
+                go.Scatter(
+                    x=t_rel,
+                    y=p_out_w,
+                    name="Signal out",
+                    yaxis="y2",
+                    line=dict(color="#EF553B"),
+                )
             )
-        )
-        apply_plotly_temporal_dual_axis(fig_t, t_rel, p_in_w, p_out_w, xlim_ns)
-        fig_t.update_layout(
-            title="Temporal signal (t=0 at packet center, dual axis)",
-            height=380,
-        )
-        st.plotly_chart(fig_t, use_container_width=True)
-
-        spec_in = integrate_signal_spectrum(sig_in, t, wl, plot_spec)
-        spec_out = integrate_signal_spectrum(sig_out, t, wl, plot_spec)
-        lam_lo, lam_hi = spectrum_plot_limits(plot_spec)
-        m_l = (wl >= lam_lo) & (wl <= lam_hi)
-
-        fig_l = go.Figure()
-        fig_l.add_trace(go.Scatter(x=wl[m_l], y=spec_in[m_l], name="Spectrum in"))
-        fig_l.add_trace(go.Scatter(x=wl[m_l], y=spec_out[m_l], name="Spectrum out"))
-        apply_plotly_spectrum_layout(fig_l, plot_spec)
-        fig_l.update_layout(title="Signal spectrum (time-integrated)", height=380)
-        st.plotly_chart(fig_l, use_container_width=True)
-
-        t_center = packet_center_time_s(plot_spec)
-        m_t = (t >= t_center + xlim_ns[0] * 1e-9) & (t <= t_center + xlim_ns[1] * 1e-9)
-
-        fig_hm = go.Figure(
-            data=go.Heatmap(
-                x=wl[m_l],
-                y=(t[m_t] - t_center) * 1e9,
-                z=sig_out[np.ix_(m_t, m_l)],
-                colorscale="Viridis",
-                colorbar_title="W/nm",
+            apply_plotly_temporal_dual_axis(fig_t, t_rel, p_in_w, p_out_w, xlim_ns)
+            fig_t.update_layout(
+                title="Temporal signal (t=0 at packet center, dual axis)",
+                height=380,
             )
-        )
-        apply_plotly_time_heatmap_layout(fig_hm, t, wl, plot_spec)
-        fig_hm.update_layout(title="Output signal P(t, λ)", height=420)
-        st.plotly_chart(fig_hm, use_container_width=True)
+            st.plotly_chart(fig_t, use_container_width=True)
+
+            spec_in = integrate_signal_spectrum(sig_in, t, wl, plot_spec)
+            spec_out = integrate_signal_spectrum(sig_out, t, wl, plot_spec)
+            lam_lo, lam_hi = spectrum_plot_limits(plot_spec)
+            m_l = (wl >= lam_lo) & (wl <= lam_hi)
+
+            fig_l = go.Figure()
+            fig_l.add_trace(go.Scatter(x=wl[m_l], y=spec_in[m_l], name="Spectrum in"))
+            fig_l.add_trace(go.Scatter(x=wl[m_l], y=spec_out[m_l], name="Spectrum out"))
+            apply_plotly_spectrum_layout(fig_l, plot_spec)
+            fig_l.update_layout(title="Signal spectrum (time-integrated)", height=380)
+            st.plotly_chart(fig_l, use_container_width=True)
+
+            t_center = packet_center_time_s(plot_spec)
+            m_t = (t >= t_center + xlim_ns[0] * 1e-9) & (t <= t_center + xlim_ns[1] * 1e-9)
+
+            fig_hm = go.Figure(
+                data=go.Heatmap(
+                    x=wl[m_l],
+                    y=(t[m_t] - t_center) * 1e9,
+                    z=sig_out[np.ix_(m_t, m_l)],
+                    colorscale="Viridis",
+                    colorbar_title="W/nm",
+                )
+            )
+            apply_plotly_time_heatmap_layout(fig_hm, t, wl, plot_spec)
+            fig_hm.update_layout(title="Output signal P(t, λ)", height=420)
+            st.plotly_chart(fig_hm, use_container_width=True)
+        else:
+            st.subheader("Per-channel results")
+            sig_infos = [c for c in (result.signal_channels_info or []) if c.get("spec") is not None]
+            if sig_infos:
+                sig_tabs = st.tabs([c["name"] for c in sig_infos])
+                for sig_tab, ch in zip(sig_tabs, sig_infos):
+                    with sig_tab:
+                        ch_spec = ch["spec"]
+                        wl_ch = wl[ch["slice"]]
+                        p_in_ch = ch["p_in_w_nm"]
+                        p_out_ch = ch["p_out_w_nm"]
+
+                        mm1, mm2 = st.columns(2)
+                        mm1.metric("Energy in", f"{ch['energy_in_j'] * 1e6:.4f} µJ")
+                        mm2.metric("Energy out", f"{ch['energy_out_j'] * 1e6:.4f} µJ")
+
+                        p_in_t_ch = integrated_power_vs_time(p_in_ch, wl_ch)
+                        p_out_t_ch = integrated_power_vs_time(p_out_ch, wl_ch)
+                        t_rel_ch, p_in_w_ch, p_out_w_ch, xlim_ns_ch = sample_temporal_traces(
+                            t, p_in_t_ch, p_out_t_ch, ch_spec
+                        )
+                        fig_t_ch = go.Figure()
+                        fig_t_ch.add_trace(
+                            go.Scatter(
+                                x=t_rel_ch, y=p_in_w_ch, name="Signal in", line=dict(color="#636EFA")
+                            )
+                        )
+                        fig_t_ch.add_trace(
+                            go.Scatter(
+                                x=t_rel_ch,
+                                y=p_out_w_ch,
+                                name="Signal out",
+                                yaxis="y2",
+                                line=dict(color="#EF553B"),
+                            )
+                        )
+                        apply_plotly_temporal_dual_axis(
+                            fig_t_ch, t_rel_ch, p_in_w_ch, p_out_w_ch, xlim_ns_ch
+                        )
+                        fig_t_ch.update_layout(
+                            title=f"{ch['name']}: temporal signal (t=0 at packet center)", height=340
+                        )
+                        st.plotly_chart(fig_t_ch, use_container_width=True)
+
+                        spec_in_ch = integrate_signal_spectrum(p_in_ch, t, wl_ch, ch_spec)
+                        spec_out_ch = integrate_signal_spectrum(p_out_ch, t, wl_ch, ch_spec)
+                        fig_l_ch = go.Figure()
+                        fig_l_ch.add_trace(go.Scatter(x=wl_ch, y=spec_in_ch, name="Spectrum in"))
+                        fig_l_ch.add_trace(go.Scatter(x=wl_ch, y=spec_out_ch, name="Spectrum out"))
+                        apply_plotly_spectrum_layout(fig_l_ch, ch_spec)
+                        fig_l_ch.update_layout(
+                            title=f"{ch['name']}: spectrum (time-integrated)", height=340
+                        )
+                        st.plotly_chart(fig_l_ch, use_container_width=True)
+
+                        t_center_ch = packet_center_time_s(ch_spec)
+                        m_t_ch = (t >= t_center_ch + xlim_ns_ch[0] * 1e-9) & (
+                            t <= t_center_ch + xlim_ns_ch[1] * 1e-9
+                        )
+                        fig_hm_ch = go.Figure(
+                            data=go.Heatmap(
+                                x=wl_ch,
+                                y=(t[m_t_ch] - t_center_ch) * 1e9,
+                                z=p_out_ch[m_t_ch],
+                                colorscale="Viridis",
+                                colorbar_title="W/nm",
+                            )
+                        )
+                        apply_plotly_time_heatmap_layout(fig_hm_ch, t, wl_ch, ch_spec)
+                        fig_hm_ch.update_layout(title=f"{ch['name']}: output P(t, λ)", height=380)
+                        st.plotly_chart(fig_hm_ch, use_container_width=True)
+            else:
+                st.caption("No per-channel signal info available for this run.")
+
+            pump_infos = result.pump_channels_info or []
+            if pump_infos:
+                st.markdown("**Pump channels**")
+                st.dataframe(
+                    [
+                        {
+                            "Name": pc["name"],
+                            "λ (nm)": pc["wavelength_nm"],
+                            "Energy in (mJ)": pc["energy_in_j"] * 1e3,
+                            "Energy out (mJ)": pc["energy_out_j"] * 1e3,
+                            "Absorbed fraction": pc["absorbed_fraction"],
+                        }
+                        for pc in pump_infos
+                    ],
+                    use_container_width=True,
+                )
+                fig_pump_ch = go.Figure()
+                for pc in pump_infos:
+                    fig_pump_ch.add_trace(go.Scatter(x=z, y=pc["p_z_w"], name=pc["name"]))
+                fig_pump_ch.update_layout(
+                    title="Per-channel pump power vs z",
+                    xaxis_title="z (m)",
+                    yaxis_title="Pump power (W)",
+                    height=340,
+                )
+                st.plotly_chart(fig_pump_ch, use_container_width=True)
 
         st.subheader("Population snapshots (quasi-2-level, N₁ ≈ 0)")
         from laser_sim.viz.populations import (
@@ -936,9 +1353,3 @@ with tab_run:
             else ""
         )
         st.plotly_chart(build_small_signal_gain_vs_z_figure(result), use_container_width=True)
-
-    # Persist equalization UI from last successful run (survives Streamlit reruns).
-    _last_out = st.session_state.get("last_sim_outcome")
-    if _last_out is not None and getattr(_last_out, "ok", False):
-        with st.expander("Packet equalization (last run)", expanded=False):
-            _render_flat_packet_weights_ui(_last_out, button_key="apply_flat_weights_last")

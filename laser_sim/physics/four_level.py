@@ -82,6 +82,57 @@ def steady_state_n2_fraction_pump(
     return w_p_abs / (w_p_abs + w_p_esa + 1.0 / max(tau_21_s, 1e-30))
 
 
+def multichannel_pump_rate_per_ion(
+    channel_intensities: list[tuple[float, float, float, float]],
+) -> tuple[float, float]:
+    """
+    Sum pump absorption/ESA rates across pump channels.
+
+    Each entry is (ip_w_m2, sigma_p, sigma_ep, hnu_p) with ip = P/A_pump for that channel.
+  Γ_p is applied only in z-propagation (``advance_pump_power_z``), not here.
+    """
+    w_pa, w_pe = 0.0, 0.0
+    for ip, sigma_p, sigma_ep, hnu_p in channel_intensities:
+        if ip <= 0.0 or hnu_p <= 0.0:
+            continue
+        flux = ip / hnu_p
+        w_pa += flux * sigma_p
+        w_pe += flux * sigma_ep
+    return w_pa, w_pe
+
+
+def _pump_ip_at_index(
+    it: int,
+    t: np.ndarray,
+    p_pf: np.ndarray,
+    p_pb: np.ndarray,
+    a_pump_m2: float,
+) -> float:
+    if a_pump_m2 <= 0.0:
+        return 0.0
+    if it <= 0:
+        # Halved t=0 intensity: matches the warm-start seed convention of
+        # march_populations_pump_qss (the validated single-channel baseline).
+        return float((p_pf[0] + p_pb[0]) * 0.5 / a_pump_m2)
+    # Trapezoidal average of total (fwd+bwd) power over [it-1, it] — same
+    # convention as the single-channel march in march_populations_pump_qss.
+    p_mid = 0.5 * (p_pf[it - 1] + p_pb[it - 1] + p_pf[it] + p_pb[it])
+    return float(p_mid / a_pump_m2)
+
+
+def pump_rates_from_channel_rows(
+    it: int,
+    t: np.ndarray,
+    channel_rows: list[tuple[np.ndarray, np.ndarray, float, float, float, float]],
+) -> tuple[float, float]:
+    """(w_p_abs, w_p_esa) from per-channel (p_fwd, p_bwd, σ_p, σ_ep, hν, A_pump) rows at z."""
+    intensities: list[tuple[float, float, float, float]] = []
+    for p_f, p_b, sigma_p, sigma_ep, hnu_p, a_pump in channel_rows:
+        ip = _pump_ip_at_index(it, t, p_f, p_b, a_pump)
+        intensities.append((ip, sigma_p, sigma_ep, hnu_p))
+    return multichannel_pump_rate_per_ion(intensities)
+
+
 def guided_fraction_into_mode(eta_guided: float, gamma_s: float) -> float:
     """Fraction of N₂ spontaneous decay coupled into the guided signal/ASE mode."""
     return float(np.clip(eta_guided * gamma_s, 0.0, 1.0))
@@ -240,13 +291,22 @@ def march_level_interval(
     include_signal: bool = True,
     p_ase_row: np.ndarray | None = None,
     couple_ase: bool = True,
+    pump_channel_rows: list[tuple[np.ndarray, np.ndarray, float, float, float, float]]
+    | None = None,
+    pump_time_index: int = 0,
+    pump_time_s: np.ndarray | None = None,
 ) -> tuple[float, float, float]:
     """Integrate rate equations over Δt at fixed z (signal + ASE + pump + spontaneous)."""
     n_sub = _substeps_for_interval(dt, lifetimes)
     dt_sub = dt / n_sub
-    w_p_abs, w_p_esa = pump_rate_per_ion(
-        ip_w_m2, gamma_p=gamma_p, sigma_p=sigma_p, sigma_ep=sigma_ep, hnu_p=hnu_p
-    )
+    if pump_channel_rows is not None and pump_time_s is not None:
+        w_p_abs, w_p_esa = pump_rates_from_channel_rows(
+            pump_time_index, pump_time_s, pump_channel_rows
+        )
+    else:
+        w_p_abs, w_p_esa = pump_rate_per_ion(
+            ip_w_m2, gamma_p=gamma_p, sigma_p=sigma_p, sigma_ep=sigma_ep, hnu_p=hnu_p
+        )
     p_ase = p_ase_row if p_ase_row is not None else np.zeros_like(p_sig_row)
     w_se, w_abs = combined_field_rates(
         p_sig_row if include_signal else np.zeros_like(p_sig_row),
@@ -339,6 +399,8 @@ def march_populations_pump_qss(
     hnu_p: float,
     lifetimes: FourLevelLifetimes,
     initial_n2_fraction: float = 0.0,
+    pump_channel_rows: list[tuple[np.ndarray, np.ndarray, float, float, float, float]]
+    | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Pump-only causal march; N₃ QSS; N₁ = 0."""
     nt = t.size
@@ -353,11 +415,21 @@ def march_populations_pump_qss(
     n2i = float(n_tot) * f2
     n3i = 0.0
     if f2 <= 0.0 and nt > 0:
-        ip0 = float((p_pf[0] + p_pb[0]) * 0.5 / a_pump)
-        if ip0 > 0.0:
-            w0a, w0e = pump_rate_per_ion(
-                ip0, gamma_p=gamma_p, sigma_p=sigma_p, sigma_ep=sigma_ep, hnu_p=hnu_p
+        if pump_channel_rows:
+            w0a, w0e = pump_rates_from_channel_rows(0, t, pump_channel_rows)
+        else:
+            # Warm-start seed uses half the t=0 intensity (historical convention;
+            # the validated baseline and the energy-budget check are calibrated
+            # to it — see _pump_ip_at_index for the matching multichannel seed).
+            ip0 = float((p_pf[0] + p_pb[0]) * 0.5 / a_pump)
+            w0a, w0e = (
+                pump_rate_per_ion(
+                    ip0, gamma_p=gamma_p, sigma_p=sigma_p, sigma_ep=sigma_ep, hnu_p=hnu_p
+                )
+                if ip0 > 0.0
+                else (0.0, 0.0)
             )
+        if w0a > 0.0 or w0e > 0.0:
             n2i = steady_state_n2_fraction_pump(w0a, w0e, lt.tau_21_s) * n_tot
             n3i = w0a * n0i * lt.tau_32_s / (1.0 + w0e * lt.tau_32_s)
             n2i = min(n2i, n_tot - n3i)
@@ -365,10 +437,13 @@ def march_populations_pump_qss(
     for it in range(nt):
         if it > 0:
             dt_i = float(t[it] - t[it - 1])
-            ip = float((p_pf[it - 1] + p_pb[it - 1] + p_pf[it] + p_pb[it]) * 0.5 / a_pump)
-            w_p_abs, w_p_esa = pump_rate_per_ion(
-                ip, gamma_p=gamma_p, sigma_p=sigma_p, sigma_ep=sigma_ep, hnu_p=hnu_p
-            )
+            if pump_channel_rows:
+                w_p_abs, w_p_esa = pump_rates_from_channel_rows(it, t, pump_channel_rows)
+            else:
+                ip = float((p_pf[it - 1] + p_pb[it - 1] + p_pf[it] + p_pb[it]) * 0.5 / a_pump)
+                w_p_abs, w_p_esa = pump_rate_per_ion(
+                    ip, gamma_p=gamma_p, sigma_p=sigma_p, sigma_ep=sigma_ep, hnu_p=hnu_p
+                )
             n0i = max(n_tot - n2i - n3i, 0.0)
             # N3 QSS (τ₃₂ ≪ Δt): unchanged, N₃ is small
             n3_ss = w_p_abs * n0i * lt.tau_32_s / (1.0 + w_p_esa * lt.tau_32_s)

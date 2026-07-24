@@ -82,6 +82,9 @@ class SimInputs:
     passive_fiber_after_m: float = 0.0
     n2_override_m2_per_w: float | None = None
     pulse_relative_powers: list[float] | None = None
+    multichannel_mode: bool = False
+    signal_channels_inputs: list | None = None  # list[dict] → SignalChannel
+    pump_channels_inputs: list | None = None  # list[dict] → PumpChannel
 
 
 @dataclass
@@ -113,6 +116,41 @@ class SimRunOutcome:
     warmup_result: RepRateWarmupResult | None = None
     signal_spec: ChirpedBurstSpec | None = None
     pump_wavelength_datasheet_nm: float | None = None
+    powerpoint_export_path: str | None = None
+
+
+def _channels_from_inputs(inp: SimInputs) -> tuple[list, list]:
+    """Build ``SignalChannel`` / ``PumpChannel`` lists from GUI dict payloads."""
+    from laser_sim.pulses.chirp import ChirpedBurstSpec, PumpPulseSpec
+    from laser_sim.pulses.multichannel import PumpChannel, SignalChannel
+
+    sig_chs: list = []
+    for d in inp.signal_channels_inputs or []:
+        spec_d = dict(d.get("spec", {}))
+        spec = ChirpedBurstSpec(**spec_d)
+        sig_chs.append(
+            SignalChannel(
+                name=str(d.get("name", "signal")),
+                spec=spec,
+                n_lambda=int(d.get("n_lambda", 32)),
+                lambda_half_window_nm=float(d.get("lambda_half_window_nm", 4.0)),
+                enabled=bool(d.get("enabled", True)),
+            )
+        )
+    pump_chs: list = []
+    for d in inp.pump_channels_inputs or []:
+        pspec_d = dict(d.get("spec", {}))
+        pspec = PumpPulseSpec(**pspec_d)
+        pump_chs.append(
+            PumpChannel(
+                name=str(d.get("name", "pump")),
+                spec=pspec,
+                cladding_pumped=bool(d.get("cladding_pumped", inp.cladding_pumped)),
+                backward_fraction=float(d.get("backward_fraction", 0.0)),
+                enabled=bool(d.get("enabled", True)),
+            )
+        )
+    return sig_chs, pump_chs
 
 
 def simulation_pump_wavelength_nm(inp: SimInputs) -> float:
@@ -371,6 +409,9 @@ def run_simulation(
             warmup_converged = warm.converged
             warmup_notes = warm.notes
 
+        sig_chs, pump_chs = (
+            _channels_from_inputs(inp) if inp.multichannel_mode else ([], [])
+        )
         cfg = FiberCPAConfig(
             material=material,
             fiber_length_m=inp.fiber_length_m,
@@ -388,6 +429,8 @@ def run_simulation(
             include_ase=inp.include_ase,
             initial_n2_fraction=initial_n2_fraction,
             initial_n2_fraction_z=initial_n2_fraction_z,
+            signal_channels=sig_chs,
+            pump_channels=pump_chs,
         )
 
         t0 = time.perf_counter()
