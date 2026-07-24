@@ -7,3 +7,6 @@ taichi>=1.7.0
 dearpygui>=1.11
 python-pptx>=0.6.21
 matplotlib>=3.7
+jax
+jaxlib
+diffrax
