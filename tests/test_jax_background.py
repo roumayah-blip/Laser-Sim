@@ -22,7 +22,11 @@ from laser_sim.calculators.dopant import estimate_dopant_concentration
 from laser_sim.materials import load_material
 from laser_sim.physics.fiber_cpa import FiberCPAConfig, run_fiber_cpa
 from laser_sim.physics.four_level import gain_coefficient_m, spontaneous_power_w_per_nm
-from laser_sim.physics.jax_background import propagate_log_space, solve_stage1_forward
+from laser_sim.physics.jax_background import (
+    propagate_log_space,
+    solve_stage1_bidirectional,
+    solve_stage1_forward,
+)
 from laser_sim.pulses.chirp import ChirpedBurstSpec, PumpPulseSpec
 
 
@@ -221,3 +225,67 @@ def test_stage1_forward_matches_cpu_in_a_safe_low_gain_regime():
     expected_transmission = np.exp(-kappa_np_m * z[-1])
     got_transmission = res.pump_power_w[-1] / res.pump_power_w[0]
     assert got_transmission == pytest.approx(expected_transmission, rel=0.05)
+
+
+def test_stage1_bidirectional_backward_pump_matches_cpu_regression_case():
+    """
+    Cross-check against tests/test_pump_absorption.py::
+    test_backward_pump_propagates_along_fiber (all pump backward, weakly
+    absorbing fiber): backward pump must be largest at z=L and monotonically
+    decay toward z=0, with roughly uniform inversion along the fiber.
+
+    NOTE: this only exercises the backward-*pump* path (no ASE channels).
+    Bidirectional ASE (backward-propagating ASE bins) is not yet practical
+    with the current exact-Newton shooting method -- even a single forward
+    integration attempt at full pump power with a naive backward-ASE guess
+    fails to converge within the step budget, and that compounds badly
+    across Newton iterations and continuation steps. Fixing that needs a
+    cheaper iteration scheme (e.g. damped fixed-point/Picard, matching the
+    existing CPU _pump_pass's 3-sweep pattern) instead of an exact Jacobian
+    Newton solve -- tracked as follow-up work, not covered by this test.
+    """
+    mat = load_material("yb_glass")
+    n_tot = 5e25
+    r_core, r_clad = 5e-6, 200e-6
+    gamma_p = (r_core / r_clad) ** 2
+    sigma_p = float(mat.sigma_abs_at(976.0)[0])
+    sigma_ep = float(mat.sigma_em_at(976.0)[0])
+    hnu_p = float(mat.photon_energy_j(976.0)[0])
+    a_pump = np.pi * r_clad**2
+    a_signal = np.pi * r_core**2
+
+    wl_ch = np.array([1030.0])
+    sigma_a_ch = mat.sigma_abs_at(wl_ch)
+    sigma_e_ch = mat.sigma_em_at(wl_ch)
+    hnu_ch = mat.photon_energy_j(wl_ch)
+
+    z = np.linspace(0.0, 0.3, 12)
+    res = solve_stage1_bidirectional(
+        z,
+        n_tot=n_tot,
+        gamma_p=gamma_p,
+        sigma_p=sigma_p,
+        sigma_ep=sigma_ep,
+        hnu_p=hnu_p,
+        a_pump=a_pump,
+        p_pump_fwd_in_w=1e-9,
+        p_pump_bwd_in_w=20.0,
+        gamma_s=1.0,
+        channel_wavelengths_nm=wl_ch,
+        sigma_a_ch=sigma_a_ch,
+        sigma_e_ch=sigma_e_ch,
+        a_signal=a_signal,
+        p_ch_fwd_in_w=np.array([1e-9]),
+        tau_21_s=mat.lifetime_s,
+        is_ase=np.array([False]),
+        eta_guided=0.6,
+        dlam_ch_nm=np.array([1.0]),
+        material_hnu_ch=hnu_ch,
+    )
+
+    assert res.converged
+    assert np.all(np.isfinite(res.pump_bwd_w))
+    assert np.all(np.isfinite(res.n2_fraction))
+    assert res.pump_bwd_w[0] > 0.5 * res.pump_bwd_w[-1]
+    assert np.all(np.diff(res.pump_bwd_w) >= -1e-6)
+    assert res.n2_fraction[0] > 0.5 * res.n2_fraction[-1]
