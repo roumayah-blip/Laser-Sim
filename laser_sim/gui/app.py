@@ -104,6 +104,40 @@ def _save_powerpoint_slide(inp: SimInputs, outcome: SimRunOutcome, material_labe
     )
 
 
+def _gain_curves_output_dir() -> Path:
+    return Path(__file__).resolve().parents[2] / "gain_curves"
+
+
+def _export_gain_curves_all(inp: SimInputs, outcome: SimRunOutcome) -> list:
+    """Extract & save temporally+spectrally resolved gain curves for EVERY pulse
+    in the burst, for the 'Temporally and Spectrally Resolved SPM' NLSE tool."""
+    from laser_sim.exporters.gain_curves import export_all_pulses
+
+    out_dir = _gain_curves_output_dir()
+    return export_all_pulses(outcome.result, str(out_dir), sim_inputs=inp)
+
+
+def _render_gain_export_status() -> None:
+    """Show last gain-curve export result + per-pulse download buttons."""
+    saved = st.session_state.get("last_gain_curves")
+    if saved:
+        st.success(f"Gain curves saved under `{_gain_curves_output_dir()}/` "
+                   f"({len(saved)} pulses)")
+        for p, npz, _csv, g0_db in saved:
+            g0 = f"{g0_db:.1f} dB" if g0_db is not None else "n/a"
+            if npz and Path(npz).is_file():
+                with open(npz, "rb") as f:
+                    st.download_button(
+                        f"Download pulse {p} gain ({g0})  →  {Path(npz).name}",
+                        f.read(), file_name=Path(npz).name,
+                        mime="application/octet-stream",
+                        key=f"download_gain_{p}",
+                    )
+    err = st.session_state.get("last_gain_curves_error")
+    if err:
+        st.error(f"Gain-curve export failed: {err}")
+
+
 def _render_pptx_export_status() -> None:
     """Show last successful .pptx path and download (persists across reruns)."""
     pptx_path = st.session_state.get("last_pptx_path")
@@ -999,6 +1033,25 @@ with tab_run:
                         st.session_state["last_pptx_error"] = str(exc)
             with _toolbar_right:
                 _render_pptx_export_status()
+
+            _gain_left, _gain_right = st.columns([1, 2])
+            with _gain_left:
+                if st.button(
+                    "Export gain curves (all pulses) → SPM",
+                    key="export_gain_curves",
+                    help="Save temporally & spectrally resolved gain curves for "
+                         "every pulse in the burst, for the Temporally and "
+                         "Spectrally Resolved SPM tool.",
+                ):
+                    try:
+                        st.session_state["last_gain_curves"] = _export_gain_curves_all(
+                            _inp, _outcome
+                        )
+                        st.session_state.pop("last_gain_curves_error", None)
+                    except Exception as exc:
+                        st.session_state["last_gain_curves_error"] = str(exc)
+            with _gain_right:
+                _render_gain_export_status()
             _render_flat_packet_weights_ui(_outcome, button_key="apply_flat_weights_persist")
 
             outcome = _outcome
